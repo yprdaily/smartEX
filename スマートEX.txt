@@ -1,0 +1,2922 @@
+const CONFIG = {
+  MAIN_SPREADSHEET_ID: "YOUR_MAIN_SPREADSHEET_ID_HERE",
+  LOG_SPREADSHEET_ID: "YOUR_LOG_SPREADSHEET_ID_HERE",
+  EMP_SHEET: "社員情報",
+  TEMPLATE_FISCAL_SHEET: "新幹線 2025/12-",
+  MGMT_SHEET: "スマートEX管理",
+  CHANGELOG_SHEET: "スマートEX_変更履歴",
+  AUDIT_SHEET: "スマートEX_監査ログ",
+  PARSER_SHEET: "スマートEX_パーサ異常",
+  QUEUE_SHEET: "スマートEX_再試行キュー",
+  DASHBOARD_SHEET: "スマートEX_ダッシュボード",
+  OVERRIDE_SHEET: "スマートEX_Override履歴",
+  DONE_MSG_SHEET: "スマートEX_処理済Msg",
+  FREE_SEAT_SHEET: "スマートEX_自由席（時刻なし）",
+  LABEL_DONE: "スマートEX_処理済",
+  LABEL_ERROR: "スマートEX_エラー",
+  LABEL_QUARANTINE: "スマートEX_要確認",
+  LABEL_NOTIFY_ADMIN: "スマートEX_通知_管理者",
+  LABEL_NOTIFY_SOUMU: "スマートEX_通知_総務",
+  LABEL_Q_TARGET_MISSING: "スマートEX_要確認/変更対象なし",
+  LABEL_Q_AMBIGUOUS: "スマートEX_要確認/曖昧候補",
+  LABEL_Q_PARSER: "スマートEX_要確認/パーサ異常",
+  LABEL_Q_REPROCESS_ONE: "スマートEX_要確認/再処理_単発",
+  NOTIFY_SOUMU_IMPORT_OK: false,
+  NOTIFY_SOUMU_MISSING_CARD: true,
+  SOUMU_MAIL: "soumu@example.com",
+  ADMIN_MAIL: "admin@example.com",
+  CALENDAR_ID: "admin@example.com",
+  CALENDAR_COLOR: CalendarApp.EventColor.BLUE,
+  BREAKER_FAIL_LIMIT: 3,
+  PAIRING_WINDOW_HOURS: 72,
+  MAIN_HEADER_ROW: 2,
+  MAIN_DATA_START_ROW: 3,
+  FISCAL_HEADER_ROW: 3,
+  FISCAL_DATA_START_ROW: 4,
+  FISCAL_KEY_COL: 14,
+  FISCAL_KEY_HEADER: "予約キー",
+  OVERRIDE_PREFIX: "SMX_OVERRIDE_MSGID_",
+  NOTIFY_SUCCESS: true,
+  NOTIFY_TTL_SECONDS: 7200,
+  SUCCESS_NOTIFY_TTL_SECONDS: 3600,
+  RETRY_MAX_TRIES: 6,
+  GMAIL_MAX_THREADS_PER_RUN: 200,
+  GMAIL_PAGE_SIZE: 50
+};
+
+const COL_MAIN = { DATE: 1, VENDOR: 2, AMOUNT: 3, TARGET: 4, ITEM: 5, URL: 6, COMPANY: 7, REMARKS: 8, KEY: 9 };
+const COL_FISCAL = { ORDER: 2, RIDE: 3, USER: 4, FROM: 6, TO: 7, AMOUNT: 8, BILL: 12, RESERVE: 13, KEY: 14 };
+
+let __MG_COL_CACHE = null;
+let __MG_COL_CACHE_SIG = "";
+let __VALIDATION_CACHE = {};
+let __HEADER_COL_CACHE = {};
+
+function fitValueToValidationFast_(sh, colIndex, value) {
+  const v = String(value || "");
+  if (!v) return "";
+  const cacheKey = sh.getSheetId() + "_" + colIndex;
+  if (!__VALIDATION_CACHE[cacheKey]) {
+    try {
+      const dv = sh.getRange(CONFIG.MAIN_DATA_START_ROW, colIndex).getDataValidation();
+      if (dv) {
+        const criteria = dv.getCriteriaType();
+        const args = dv.getCriteriaValues();
+        let list = [];
+        if (criteria === SpreadsheetApp.DataValidationCriteria.VALUE_IN_LIST) {
+          list = (args && args[0]) ? args[0].map(String) : [];
+        } else if (criteria === SpreadsheetApp.DataValidationCriteria.VALUE_IN_RANGE) {
+          const rng = args && args[0] ? args[0] : null;
+          if (rng) list = rng.getValues().flat().map(String);
+        }
+        __VALIDATION_CACHE[cacheKey] = { hasValidation: true, list: list };
+      } else {
+        __VALIDATION_CACHE[cacheKey] = { hasValidation: false };
+      }
+    } catch (e) {
+      __VALIDATION_CACHE[cacheKey] = { hasValidation: false };
+    }
+  }
+  const cache = __VALIDATION_CACHE[cacheKey];
+  if (!cache.hasValidation || !cache.list || cache.list.length === 0) return v;
+  const list = cache.list;
+  if (list.includes(v)) return v;
+  const partial = list.find(x => x.indexOf(v) >= 0);
+  if (partial) return partial;
+  if (v === "新幹線") {
+    const fuzzy = list.find(x => x.includes("交通") || x.includes("旅費"));
+    if (fuzzy) return fuzzy;
+  }
+  return v;
+}
+
+function findColByHeaderFast_(sh, headerRow, candidates) {
+  const cacheKey = sh.getSheetId() + "_" + headerRow;
+  if (!__HEADER_COL_CACHE[cacheKey]) {
+    const lastCol = sh.getLastColumn();
+    if (lastCol <= 0) return 0;
+    const headers = sh.getRange(headerRow, 1, 1, lastCol).getValues()[0].map(v => String(v || ""));
+    __HEADER_COL_CACHE[cacheKey] = headers;
+  }
+  const headers = __HEADER_COL_CACHE[cacheKey];
+  const idx = headerIndexFlex_(headers, candidates);
+  return idx >= 0 ? (idx + 1) : 0;
+}
+
+function primeMgmtColCache_() {
+  const ss = ssLog_();
+  const sh = ss.getSheetByName(CONFIG.MGMT_SHEET);
+  const lastCol = sh.getLastColumn();
+  const sig = ss.getId() + "|" + sh.getSheetId() + "|" + String(lastCol);
+  if (__MG_COL_CACHE && __MG_COL_CACHE_SIG === sig) return;
+  const headers = sh.getRange(1, 1, 1, lastCol).getValues()[0].map(v => String(v || ""));
+  const map = {};
+  for (let i = 0; i < headers.length; i++) {
+    const h = headers[i];
+    if (h) map[h] = i + 1;
+  }
+  __MG_COL_CACHE = map;
+  __MG_COL_CACHE_SIG = sig;
+}
+
+function invalidateMgmtColCache_() {
+  __MG_COL_CACHE = null;
+  __MG_COL_CACHE_SIG = "";
+}
+
+function doneSheetNameByYear_(year) {
+  return `${CONFIG.DONE_MSG_SHEET}_${year}`;
+}
+
+function ensureDoneSheetRotated_() {
+  const ss = ssLog_();
+  const y = new Date().getFullYear();
+  const curName = doneSheetNameByYear_(y);
+  if (ss.getSheetByName(curName)) return;
+  const base = ss.getSheetByName(CONFIG.DONE_MSG_SHEET);
+  const prevName = doneSheetNameByYear_(y - 1);
+  if (base && !ss.getSheetByName(prevName)) {
+    try { base.setName(prevName); } catch (_) {}
+  }
+  let sh = ss.getSheetByName(curName);
+  if (!sh) {
+    sh = ss.insertSheet(curName);
+    sh.appendRow(["GmailMsgId", "ThreadId", "処理日時"]);
+  }
+}
+
+function getDoneSheetsForLookup_() {
+  const ss = ssLog_();
+  const y = new Date().getFullYear();
+  const names = [doneSheetNameByYear_(y), doneSheetNameByYear_(y - 1)];
+  const out = [];
+  for (const n of names) {
+    const sh = ss.getSheetByName(n);
+    if (sh) out.push(sh);
+  }
+  return out;
+}
+
+function loadDoneMsgIdSet_() {
+  const out = new Set();
+  const sheets = getDoneSheetsForLookup_();
+  for (const sh of sheets) {
+    const lastRow = sh.getLastRow();
+    if (lastRow < 2) continue;
+    const vals = sh.getRange(2, 1, lastRow - 1, 1).getValues();
+    for (let i = 0; i < vals.length; i++) {
+      const v = String(vals[i][0] || "").trim();
+      if (v) out.add(v);
+    }
+  }
+  return out;
+}
+
+function loadMgmtKeyRowMap_() {
+  const ss = ssLog_();
+  const sh = ss.getSheetByName(CONFIG.MGMT_SHEET);
+  const lastRow = sh.getLastRow();
+  const out = new Map();
+  if (lastRow < 2) return out;
+  const cKey = mgCol_("予約キー");
+  const keys = sh.getRange(2, cKey, lastRow - 1, 1).getValues();
+  for (let i = 0; i < keys.length; i++) {
+    const k = String(keys[i][0] || "").trim();
+    if (!k) continue;
+    out.set(k, i + 2);
+  }
+  return out;
+}
+
+function isMsgDoneFast_(doneSet, msgId) {
+  return doneSet ? doneSet.has(String(msgId || "")) : false;
+}
+
+function markMsgDoneFast_(doneSet, msgId, threadId) {
+  markMsgDone_(msgId, threadId);
+  if (doneSet) doneSet.add(String(msgId || ""));
+}
+
+function getMgmtByKeyFast_(keyMap, key) {
+  const k = String(key || "").trim();
+  if (!k || !keyMap) return null;
+  const row = keyMap.get(k);
+  if (!row) return null;
+  return readMgmtByRow_(row);
+}
+
+function updateMgmtKeyMap_(keyMap, key, row) {
+  if (!keyMap) return;
+  const k = String(key || "").trim();
+  if (!k) return;
+  const r = Number(row || 0);
+  if (!r) return;
+  keyMap.set(k, r);
+}
+
+function onOpen() {
+  SpreadsheetApp.getUi()
+    .createMenu("スマートEX")
+    .addItem("取込実行", "fetchSmartExMail")
+    .addItem("取込実行（今日分のみ）", "fetchTodaySmartExMail")
+    .addSeparator()
+    .addItem("払戻メールを再処理（直近1ヶ月）", "reprocessRefunds")
+    .addSeparator()
+    .addItem("要確認（全）を再処理", "reprocessQuarantine")
+    .addItem("要確認（変更対象なし）を再処理", "reprocessTargetMissing")
+    .addItem("要確認（曖昧候補）を再処理", "reprocessAmbiguous")
+    .addItem("要確認（パーサ異常）を再処理", "reprocessParserQuarantine")
+    .addItem("エラーを再処理", "reprocessErrors")
+    .addItem("管理シート：選択行を再処理（カーソル位置）", "reprocessSelectedMgmtRows")
+    .addItem("管理シート：選択行のカレンダー再同期", "resyncCalendarForSelectedRows")
+    .addItem("今年分を再読み込み（通常）", "reloadFromThisYear")
+    .addItem("今年分を再読み込み（要確認のみ）", "reloadFromThisYearQuarantine")
+    .addSeparator()
+    .addItem("ダッシュボード更新", "updateDashboard")
+    .addItem("再試行キュー処理", "processRetryQueue")
+    .addSeparator()
+    .addItem("マスタ反映で再同期（行/イベント復帰）", "resyncFromMaster")
+    .addItem("再同期＋要修正抽出（コピー）", "resyncAndReportFixNeeded")
+    .addItem("カレンダー再同期（予約キー指定）", "resyncCalendarByKeyPrompt")
+    .addItem("復旧：予約キーを埋め直す", "backfillReservationKeys_")
+    .addItem("復旧：管理シートの行番号を再同期", "resyncMgmtPointers_")
+    .addSeparator()
+    .addItem("キャンセル（管理行番号指定）", "cancelByMgmtRow")
+    .addItem("キャンセル（予約キー指定）", "cancelByReservationKey")
+    .addSeparator()
+    .addItem("ブレーカー解除", "resetBreaker")
+    .addItem("手動停止（今すぐ止める）", "stopNow")
+    .addToUi();
+}
+
+function checkBreakerBeforeRun_() {
+  if (isBreakerOpen_()) {
+    SpreadsheetApp.getUi().alert(
+      "安全装置（ブレーカー）作動中",
+      "パーサ異常などのエラーが多発したため、自動取込が停止されています。\n\n" +
+      "原因を確認・解消した後、メニューの「スマートEX」＞「ブレーカー解除」を実行してから再試行してください。",
+      SpreadsheetApp.getUi().ButtonSet.OK
+    );
+    return true;
+  }
+  return false;
+}
+
+function reprocessRefunds() {
+  if (checkBreakerBeforeRun_()) return;
+  const ui = SpreadsheetApp.getUi();
+  const res = ui.alert("払戻再処理",
+    "直近1ヶ月の「払戻内容」メールを再スキャンし、未処理のものを処理します。\nカレンダーの予定は削除され、経費はマイナス計上されます。\n\n実行しますか？",
+    ui.ButtonSet.YES_NO);
+  if (res !== ui.Button.YES) return;
+  SpreadsheetApp.getActive().toast("払戻メールの再処理を開始します...");
+  const q = 'from:yoyaku@expy.jp subject:"【スマートEX】 新幹線予約払戻内容" newer_than:1m';
+  processThreads_(q);
+  SpreadsheetApp.getActive().toast("払戻メールの再処理が完了しました");
+}
+
+function reprocessSelectedMgmtRows() {
+  if (checkBreakerBeforeRun_()) return;
+  const sh = SpreadsheetApp.getActiveSheet();
+  const currentName = String(sh.getName() || "").trim();
+  const targetName = String(CONFIG.MGMT_SHEET || "").trim();
+  if (currentName !== targetName) {
+    SpreadsheetApp.getUi().alert("この機能は「" + targetName + "」シートでのみ実行できます。\n（現在のシート: " + currentName + "）");
+    return;
+  }
+  const ranges = sh.getActiveRangeList().getRanges();
+  if (!ranges.length) return;
+  const cMsgId = mgCol_("GmailMsgId");
+  const processedIds = new Set();
+  let count = 0;
+  for (const rng of ranges) {
+    const startRow = rng.getRow();
+    const numRows = rng.getNumRows();
+    if (startRow < 2) continue;
+    const msgIds = sh.getRange(startRow, cMsgId, numRows, 1).getValues().flat();
+    for (const id of msgIds) {
+      const mid = String(id || "").trim();
+      if (!mid || processedIds.has(mid)) continue;
+      SpreadsheetApp.getActive().toast("再処理中: " + mid);
+      processThreads_("id:" + mid, { force: true, targetMsgId: mid });
+      processedIds.add(mid);
+      count++;
+    }
+  }
+  SpreadsheetApp.getUi().alert(count + "件のメールを再処理しました。");
+}
+
+function fetchSmartExMail() { 
+  if (checkBreakerBeforeRun_()) return;
+  processThreads_(buildQuery_(false) + " newer_than:1m"); 
+}
+
+function fetchTodaySmartExMail() { 
+  if (checkBreakerBeforeRun_()) return;
+  processThreads_(buildQuery_(false) + " newer_than:1d"); 
+}
+
+function reprocessQuarantine() {
+  if (checkBreakerBeforeRun_()) return;
+  SpreadsheetApp.getActive().toast("要確認ラベルの再処理を開始します...");
+  processThreads_(buildQuery_(true));
+  SpreadsheetApp.getActive().toast("再処理が完了しました");
+}
+
+function normalizeSubject_(s) {
+  return String(s || "").replace(/\u00A0/g, " ").replace(/\u3000/g, " ").replace(/\s+/g, " ").trim();
+}
+
+function isAllowedSmartExSubject_(subject) {
+  const s = normalizeSubject_(subject);
+  return s === "【スマートEX】 新幹線予約内容" ||
+    s === "【スマートEX】 新幹線予約変更内容" ||
+    s === "【スマートEX】 乗車用ICカード指定内容" ||
+    s === "【スマートEX】 新幹線予約払戻内容";
+}
+
+function buildQuery_(quarantine) {
+  let q = 'from:yoyaku@expy.jp (' +
+    'subject:"【スマートEX】 新幹線予約内容" OR ' +
+    'subject:"【スマートEX】 新幹線予約変更内容" OR ' +
+    'subject:"【スマートEX】 乗車用ICカード指定内容" OR ' +
+    'subject:"【スマートEX】 新幹線予約払戻内容")';
+  if (quarantine) {
+    q += " label:" + CONFIG.LABEL_QUARANTINE;
+  } else {
+    q += " -label:" + CONFIG.LABEL_QUARANTINE + " -label:" + CONFIG.LABEL_ERROR;
+  }
+  return q;
+}
+
+function buildQueryByLabel_(labelName) {
+  return ('from:yoyaku@expy.jp ' +
+    '(subject:"【スマートEX】" OR subject:"払戻") ' +
+    'label:"' + String(labelName || "").replace(/"/g, '""') + '"').trim();
+}
+
+function reprocessTargetMissing() { 
+  if (checkBreakerBeforeRun_()) return;
+  processThreads_(buildQueryByLabel_(CONFIG.LABEL_Q_TARGET_MISSING)); 
+}
+function reprocessAmbiguous() { 
+  if (checkBreakerBeforeRun_()) return;
+  processThreads_(buildQueryByLabel_(CONFIG.LABEL_Q_AMBIGUOUS)); 
+}
+function reprocessParserQuarantine() { 
+  if (checkBreakerBeforeRun_()) return;
+  processThreads_(buildQueryByLabel_(CONFIG.LABEL_Q_PARSER)); 
+}
+
+function reprocessErrors() {
+  if (checkBreakerBeforeRun_()) return;
+  SpreadsheetApp.getActive().toast("エラーラベルの再処理を開始します...");
+  const q = buildQueryByLabel_(CONFIG.LABEL_ERROR);
+  processThreads_(q, { force: true });
+  SpreadsheetApp.getActive().toast("エラーラベルの再処理が完了しました");
+}
+
+function buildQueryFrom_(quarantine, afterYmd) {
+  let q = `from:yoyaku@expy.jp subject:"【スマートEX】" after:${afterYmd}`;
+  if (quarantine) q += ` label:${CONFIG.LABEL_QUARANTINE}`;
+  return q.trim();
+}
+
+function reloadFromThisYear() {
+  if (checkBreakerBeforeRun_()) return;
+  const year = new Date().getFullYear();
+  const ymd = `${year}/01/01`;
+  const q = buildQueryFrom_(false, ymd);
+  processThreads_(q, { forceRewrite: false });
+}
+
+function reloadFromThisYearQuarantine() {
+  if (checkBreakerBeforeRun_()) return;
+  const year = new Date().getFullYear();
+  const ymd = `${year}/01/01`;
+  const q = buildQueryFrom_(true, ymd);
+  processThreads_(q, { forceRewrite: false });
+}
+
+function processThreads_(query, opt) {
+  const lock = LockService.getScriptLock();
+  if (!lock.tryLock(30000)) return;
+  try {
+    ensureAll_();
+    if (isBreakerOpen_()) return;
+    const doneSet = loadDoneMsgIdSet_();
+    const mgmtKeyMap = loadMgmtKeyRowMap_();
+    const globalIcByKey = buildGlobalIcByKey_();
+    const options = opt || {};
+    let start = 0;
+    let processedThreads = 0;
+
+    while (processedThreads < Number(CONFIG.GMAIL_MAX_THREADS_PER_RUN || 200)) {
+      const batch = GmailApp.search(query, start, Number(CONFIG.GMAIL_PAGE_SIZE || 50));
+      if (!batch || batch.length === 0) break;
+      batch.sort((a, b) => a.getLastMessageDate().getTime() - b.getLastMessageDate().getTime());
+
+      for (const thread of batch) {
+        if (processedThreads >= CONFIG.GMAIL_MAX_THREADS_PER_RUN) break;
+        processedThreads++;
+        try {
+          const messages = thread.getMessages();
+          const threadId = thread.getId();
+          const threadLink = safeGetThreadPermalink_(thread);
+          const parsedAll = [];
+
+          for (const m of messages) {
+            const rawSub = m.getSubject();
+            if (!isAllowedSmartExSubject_(rawSub)) continue;
+            const subject = normalizeSubject_(rawSub);
+            const msgId = m.getId();
+            const msgDate = m.getDate();
+            const body = m.getPlainBody() || "";
+            const recs = parseSmartExMessage_(subject, body);
+            for (let i = 0; i < recs.length; i++) {
+              const r = recs[i];
+              r.msgId = msgId;
+              r.threadId = threadId;
+              r.msgDate = msgDate;
+              r.blockIndex = i + 1;
+              r.threadLink = threadLink;
+              parsedAll.push(r);
+            }
+          }
+
+          const icByKey = new Map();
+          for (const r of parsedAll) {
+            if (r.kind !== "ic") continue;
+            const rcards = r.cards || [];
+            if (!rcards.length) continue;
+            for (const b of (r.blocks || [])) {
+              const k = buildPairKey_(b);
+              if (!k) continue;
+              icByKey.set(k, { cards: rcards, msgId: r.msgId, at: r.msgDate });
+            }
+          }
+
+          let threadHasError = false;
+          let threadHasSuccess = false;
+
+          for (const m of messages) {
+            const rawSub = m.getSubject();
+            if (!isAllowedSmartExSubject_(rawSub)) continue;
+            const subject = normalizeSubject_(rawSub);
+            const msgId = m.getId();
+            if (options.targetMsgId && m.getId() !== options.targetMsgId) continue;
+            const msgDate = m.getDate();
+            const body = m.getPlainBody() || "";
+            const recs = parseSmartExMessage_(subject, body);
+            const already = isMsgDoneFast_(doneSet, msgId);
+            const force = options.force;
+            if (already && !force) continue;
+
+            let processedThisMsg = true;
+
+            if (recs.length === 0) {
+              processedThisMsg = false;
+              logParserAnomaly_("予約/カード情報抽出0件", "", body.slice(0, 1200));
+              audit_("隔離(データ抽出なし)", "", "", "", "NG", "subject=" + subject);
+            }
+
+            for (let idx = 0; idx < recs.length; idx++) {
+              const rec = recs[idx];
+              if (rec.kind === "ic") {
+                const cards = rec.cards || [];
+                if (!cards.length) {
+                  processedThisMsg = false;
+                  addLabel_(thread, CONFIG.LABEL_QUARANTINE);
+                  logParserAnomaly_("ICカード指定内容なのにカード抽出0件", "", body.slice(0, 1200));
+                  audit_("隔離(ICカード抽出0件)", "", "", "", "NG", "subject=" + subject);
+                  notifyAdminError_("【スマートEX】ICカード指定内容なのにカード抽出0件（処理済にせず隔離）", makeCandidateLink_(), msgId);
+                  break;
+                }
+                
+                const resolved = resolveCards_(cards);
+                const isMissing = resolved.missing.length > 0;
+
+                for (const b2 of (rec.blocks || [])) {
+                  if (b2 && b2.reserveNo) {
+                    if (isMissing) {
+                      notifySoumuMissingCard_(b2, resolved.missing, body, msgId);
+                      audit_("警告(未登録カード)", b2.reserveNo, "", "", "OK", resolved.missing.join(","));
+                    }
+                    putIcCards_(b2.reserveNo, cards, msgDate);
+                    backfillFromIc_(b2, cards, msgDate, threadLink);
+                  }
+                }
+                continue;
+              }
+
+              if (!rec.after) {
+                processedThisMsg = false;
+                addLabel_(thread, CONFIG.LABEL_QUARANTINE);
+                logParserAnomaly_("予約ブロック抽出失敗", "", body.slice(0, 1200));
+                incParserFail_(msgId);
+                notifyAdminError_("【スマートEX】予約ブロック抽出失敗", makeCandidateLink_(), msgId);
+                break;
+              }
+
+              const after = rec.after;
+              const before = rec.before || null;
+              const pairKey = buildPairKey_(after);
+              const paired = pairKey ? icByKey.get(pairKey) : null;
+              const global = pairKey ? globalIcByKey.get(pairKey) : null;
+              const stored = after.reserveNo ? getIcCards_(after.reserveNo) : null;
+
+              let cards = (rec.cards && rec.cards.length) ? rec.cards :
+                (paired && paired.cards && paired.cards.length) ? paired.cards :
+                (global && global.cards && global.cards.length) ? global.cards :
+                (stored && stored.cards && stored.cards.length) ? stored.cards : [];
+
+              if ((!cards || cards.length === 0) && after.reserveNo) {
+                const fallbackCards = findIcCardsByReserveNo_(after.reserveNo);
+                if (fallbackCards && fallbackCards.length > 0) {
+                  cards = fallbackCards;
+                  putIcCards_(after.reserveNo, cards, new Date());
+                }
+              }
+
+              after.cards = cards;
+
+              const parsedObj = { after: after, kind: rec.kind, before: before, diff: after.diff || "" };
+              const ctx = {
+                subject, msgId, msgDate, threadId, threadLink, blockIndex: idx + 1,
+                reserveNo: after.reserveNo || "", rideDateStr: after.rideDateStr || "",
+                from: after.from || "", to: after.to || "", depTime: after.depTime || "",
+                arrTime: after.arrTime || "", amount: after.amount === "" ? "" : after.amount,
+                rawBlock: after.rawBlock || ""
+              };
+
+              assertParsed_(parsedObj, body, thread, msgId, ctx);
+              const resolved = resolveCards_(cards);
+              after.bases = resolved.bases || [];
+              after.company = resolved.company || "";
+              after.names = resolved.names || [];
+              after.primaryName = (after.names.length ? after.names[0] : "");
+              after.cardsMasked = maskCards_(cards);
+
+              let forceChangeMgmt = null;
+              if (rec.kind === "new") {
+                const dupCheck = findMgmtRowForChange_("", after.reserveNo, msgDate, after.rideDateStr);
+                if (dupCheck.row) {
+                  forceChangeMgmt = readMgmtByRow_(dupCheck.row);
+                }
+              }
+
+              if ((rec.kind === "new" || rec.kind === "refund") && !forceChangeMgmt) {
+                if (rec.kind === "refund") {
+                  const existMgmt = findMgmtRowForChange_("", after.reserveNo, msgDate, after.rideDateStr);
+                  if (existMgmt.row) {
+                    const m = readMgmtByRow_(existMgmt.row);
+                    if (m.EventId) deleteEvents_(m.EventId);
+                    updateMgmt_(m.row, { Status: "払戻済", EventId: "" });
+                  }
+                  after.remarks = "払戻";
+                }
+
+                const signature = buildSignature_(after);
+                const reservationKey = buildReservationKey_(signature, threadId, msgId, idx + 1);
+                const exists = getMgmtByKeyFast_(mgmtKeyMap, reservationKey) || getMgmtByKey_(reservationKey);
+
+                if (exists) {
+                  if (options.force) {
+                    updateExistingRecord_(exists, after, msgDate, threadLink);
+                    audit_("再処理(更新)", after.reserveNo, exists.MainSheet, exists.MainRow, "OK", "Fiscal/Main updated");
+                  }
+                  continue;
+                }
+
+                if (!isReasonableRideDate_(after.rideDate)) {
+                  logParserAnomaly_("乗車日不正(妥当年外)のためスキップ", after.reserveNo, body.slice(0, 1200));
+                  continue;
+                }
+
+                const mainSheet = getOrCreateMainSheet_(after.rideDate);
+                const mainRow = writeMainRow_(mainSheet, after, reservationKey, msgDate, threadLink);
+                const fiscalSheet = getOrCreateFiscalSheet_(after.rideDate);
+                const fiscalRow = writeFiscalRowSafe_(fiscalSheet, after, reservationKey, msgDate, threadLink);
+
+                const mgmtRow = registerMgmt_(after, {
+                  reservationKey, signature, firstSeen: msgDate, msgId, threadId, threadLink,
+                  mainSheet: mainSheet.getName(), mainRow, fiscalSheet: fiscalSheet.getName(), fiscalRow
+                });
+
+                updateMgmtKeyMap_(mgmtKeyMap, reservationKey, mgmtRow);
+
+                if (rec.kind === "refund") {
+                  updateMgmt_(mgmtRow, { Status: "処理済" });
+                  audit_("払戻取込", after.reserveNo, mainSheet.getName(), mainRow, "OK", "calendar deleted & skipped");
+                } else {
+                  const t = buildEventTime_(after);
+                  const hasUser = after.names && after.names.length > 0;
+                  if (t && hasUser) {
+                    const evIds = syncCalendarEvents_(mgmtRow, "", after);
+                    if (evIds) updateMgmt_(mgmtRow, { EventId: evIds, Status: "処理済" });
+                    else updateMgmt_(mgmtRow, { Status: "新規" });
+                  } else {
+                    if (isFreeSeatNoTime_(after.rawBlock)) logFreeSeatNoTime_(ctx, body);
+                    updateMgmt_(mgmtRow, { Status: "処理済" });
+                    if (!hasUser) {
+                      audit_("新規取込(委託)", after.reserveNo, mainSheet.getName(), mainRow, "OK", "calendar skipped");
+                    } else {
+                      audit_("新規取込(自由席時刻なし)", after.reserveNo, mainSheet.getName(), mainRow, "OK", "calendar skipped");
+                    }
+                  }
+                }
+                audit_((rec.kind === "refund" ? "払戻取込" : "新規取込"), after.reserveNo, mainSheet.getName(), mainRow, "OK", "");
+              } else {
+                const overrideKey = getOverrideKeyForMsgId_(msgId);
+                let mgmt = forceChangeMgmt;
+
+                if (!mgmt) {
+                  if (overrideKey) {
+                    mgmt = getMgmtByKeyFast_(mgmtKeyMap, overrideKey) || getMgmtByKey_(overrideKey);
+                    if (!mgmt) {
+                      processedThisMsg = false;
+                      addLabel_(thread, CONFIG.LABEL_QUARANTINE);
+                      logParserAnomaly_("確定予約キーが管理に存在しません", after.reserveNo, body.slice(0, 1200));
+                      notifyAdminError_("【スマートEX】確定予約キーが管理に存在しません: " + overrideKey, makeCandidateLink_(), msgId);
+                      break;
+                    }
+                  } else {
+                    const beforeSig = buildSignature_(before);
+                    const rideDateStrForMatch = (before && before.rideDateStr) ? before.rideDateStr : (after && after.rideDateStr ? after.rideDateStr : "");
+                    const sel = findMgmtRowForChange_(beforeSig, after.reserveNo, msgDate, rideDateStrForMatch);
+                    if (!sel.row) {
+                      processedThisMsg = false;
+                      addLabel_(thread, CONFIG.LABEL_QUARANTINE);
+                      addLabel_(thread, CONFIG.LABEL_Q_TARGET_MISSING);
+                      if (!shouldSuppressNotify_("Q_TARGET_MISSING_LOG", String(msgId || "") + "#" + String(idx + 1), 21600)) {
+                        logParserAnomaly_("変更対象が特定できません", after.reserveNo, body.slice(0, 1200));
+                        audit_("隔離(変更対象なし)", after.reserveNo, "", "", "PENDING", "Not found");
+                      }
+                      continue;
+                    }
+                    mgmt = readMgmtByRow_(sel.row);
+                  }
+                }
+
+                applyChange_(mgmt, after, msgId, msgDate, threadLink);
+                const afterSig = buildSignature_(after);
+                updateMgmt_(mgmt.row, { Signature: afterSig });
+                audit_("変更反映", after.reserveNo, mgmt.MainSheet, mgmt.MainRow, "OK", String(after.diff || ""));
+
+                if (overrideKey) {
+                  appendOverrideHistory_("自動クリア", msgId, overrideKey, after.reserveNo);
+                  clearOverride_(msgId);
+                }
+              }
+            }
+            if (processedThisMsg) {
+              markMsgDoneFast_(doneSet, msgId, threadId);
+              threadHasSuccess = true;
+            } else {
+              threadHasError = true;
+            }
+          }
+          if (threadHasError) {
+            addLabel_(thread, CONFIG.LABEL_QUARANTINE);
+            removeLabel_(thread, CONFIG.LABEL_DONE);
+          } else if (threadHasSuccess) {
+            addLabel_(thread, CONFIG.LABEL_DONE);
+            removeLabel_(thread, CONFIG.LABEL_QUARANTINE);
+            removeLabel_(thread, CONFIG.LABEL_Q_TARGET_MISSING);
+            removeLabel_(thread, CONFIG.LABEL_Q_PARSER);
+          }
+          removeLabel_(thread, CONFIG.LABEL_ERROR);
+        } catch (e) {
+          addLabel_(thread, CONFIG.LABEL_ERROR);
+          audit_("取込", "", "", "", "NG", String(e && e.stack ? e.stack : e));
+          notifyAdminError_(String(e && e.stack ? e.stack : e), makeCandidateLink_(), "");
+        }
+      }
+      start += Number(CONFIG.GMAIL_PAGE_SIZE || 50);
+    }
+    updateDashboard();
+  } finally {
+    lock.releaseLock();
+  }
+}
+
+function writeMainRow_(sh, d, reservationKey, msgDate, threadLink) {
+  ensureMainKeyColumn_(sh);
+  setMainHeadersIfMissing_(sh);
+  const row = findNextMainRow_(sh);
+  const targetText = buildTargetText_(d);
+  const rawCompany = String(d.company || "").trim();
+  const validItem = fitValueToValidationFast_(sh, COL_MAIN.ITEM, "新幹線");
+  const validCompany = fitValueToValidationFast_(sh, COL_MAIN.COMPANY, rawCompany);
+  const url = String(threadLink || "").trim();
+  
+  const maxCol = sh.getMaxColumns();
+  const rowData = new Array(maxCol).fill("");
+  
+  rowData[COL_MAIN.DATE - 1] = msgDate instanceof Date ? msgDate : new Date();
+  rowData[COL_MAIN.VENDOR - 1] = "スマートEX";
+  rowData[COL_MAIN.AMOUNT - 1] = d.amount === "" ? "" : d.amount;
+  rowData[COL_MAIN.TARGET - 1] = targetText;
+  rowData[COL_MAIN.ITEM - 1] = validItem;
+  rowData[COL_MAIN.URL - 1] = url;
+  rowData[COL_MAIN.COMPANY - 1] = validCompany;
+  rowData[COL_MAIN.REMARKS - 1] = d.remarks || "";
+  rowData[COL_MAIN.KEY - 1] = reservationKey;
+  
+  sh.getRange(row, 1, 1, maxCol).setValues([rowData]);
+  return row;
+}
+
+function writeFiscalRowSafe_(sh, d, reservationKey, msgDate, threadLink) {
+  ensureFiscalKeyColumn_(sh);
+  const row = findFiscalNextRow_(sh);
+  const user = (d.names && d.names.length) ? d.names.join(" ") : "";
+  
+  const maxCol = sh.getMaxColumns();
+  const rowData = new Array(maxCol).fill("");
+  
+  rowData[COL_FISCAL.ORDER - 1] = msgDate instanceof Date ? msgDate : new Date();
+  rowData[COL_FISCAL.RIDE - 1] = d.rideDate;
+  rowData[COL_FISCAL.USER - 1] = user;
+  rowData[COL_FISCAL.FROM - 1] = d.from;
+  rowData[COL_FISCAL.TO - 1] = d.to;
+  rowData[COL_FISCAL.AMOUNT - 1] = d.amount === "" ? "" : d.amount;
+  rowData[COL_FISCAL.BILL - 1] = getBillingMonth_(new Date());
+  rowData[COL_FISCAL.RESERVE - 1] = d.reserveNo || "";
+  rowData[COL_FISCAL.KEY - 1] = reservationKey;
+  
+  const headerRow = CONFIG.FISCAL_HEADER_ROW;
+  const colCompany = findColByHeaderFast_(sh, headerRow, ["会社名", "会社", "グループ"]);
+  if (colCompany > 0) rowData[colCompany - 1] = d.company || "";
+  const colUrl = findColByHeaderFast_(sh, headerRow, ["URL", "リンク"]);
+  if (colUrl > 0) rowData[colUrl - 1] = String(threadLink || "");
+  
+  sh.getRange(row, 1, 1, maxCol).setValues([rowData]);
+  return row;
+}
+
+function registerMgmt_(d, meta) {
+  const ss = ssLog_();
+  const sh = ss.getSheetByName(CONFIG.MGMT_SHEET);
+  const row = sh.getLastRow() + 1;
+  
+  const maxCol = sh.getMaxColumns();
+  const rowData = new Array(maxCol).fill("");
+  
+  const setV = (name, val) => {
+    const c = mgCol_(name);
+    if (c > 0 && c <= maxCol) rowData[c - 1] = val;
+  };
+  
+  setV("お預かり番号", d.reserveNo || "");
+  setV("状態", "新規");
+  setV("更新日時", new Date());
+  setV("MainSheet", meta.mainSheet || "");
+  setV("MainRow", meta.mainRow || "");
+  setV("FiscalSheet", meta.fiscalSheet || "");
+  setV("FiscalRow", meta.fiscalRow || "");
+  setV("EventId", "");
+  setV("出発時刻", normalizeHM_(d.depTime));
+  setV("到着時刻", normalizeHM_(d.arrTime));
+  setV("発", d.from || "");
+  setV("着", d.to || "");
+  setV("乗車日", d.rideDate || "");
+  setV("予約本文ブロック", d.rawBlock || "");
+  setV("ICカード", (d.cards || []).join(","));
+  setV("会社", d.company || "");
+  setV("予約署名", meta.signature || "");
+  setV("初回受信日時", meta.firstSeen || new Date());
+  setV("GmailMsgId", meta.msgId || "");
+  setV("ThreadId", meta.threadId || "");
+  setV("ThreadLink", meta.threadLink || "");
+  setV("予約キー", meta.reservationKey || "");
+  setV("Lastuser", "");
+  
+  sh.getRange(row, 1, 1, maxCol).setValues([rowData]);
+  return row;
+}
+
+function updateMgmt_(r, patch) {
+  const ss = ssLog_();
+  const sh = ss.getSheetByName(CONFIG.MGMT_SHEET);
+  const maxCol = sh.getMaxColumns();
+  const rng = sh.getRange(r, 1, 1, maxCol);
+  const rowData = rng.getValues()[0];
+  
+  const apply = (name, val) => {
+    if (val === undefined) return;
+    const c = mgCol_(name);
+    if (c > 0 && c <= maxCol) rowData[c - 1] = val;
+  };
+  
+  apply("状態", patch.Status);
+  apply("更新日時", new Date());
+  apply("MainSheet", patch.MainSheet);
+  apply("MainRow", patch.MainRow);
+  apply("FiscalSheet", patch.FiscalSheet);
+  apply("FiscalRow", patch.FiscalRow);
+  apply("EventId", patch.EventId);
+  apply("出発時刻", patch.Dep);
+  apply("到着時刻", patch.Arr);
+  apply("発", patch.From);
+  apply("着", patch.To);
+  apply("乗車日", patch.RideDate);
+  apply("予約本文ブロック", patch.Block);
+  apply("ICカード", patch.Cards);
+  apply("会社", patch.Company);
+  apply("予約署名", patch.Signature);
+  apply("ThreadLink", patch.ThreadLink);
+  apply("Lastuser", patch.Lastuser);
+  
+  rng.setValues([rowData]);
+}
+
+function updateExistingRecord_(mgmt, d, msgDate, threadLink) {
+  if (mgmt.FiscalSheet && mgmt.FiscalRow) {
+    const ss = ssLog_();
+    const sh = ss.getSheetByName(mgmt.FiscalSheet);
+    if (sh) {
+      const user = (d.names || []).join(" ");
+      const maxCol = sh.getMaxColumns();
+      const rng = sh.getRange(mgmt.FiscalRow, 1, 1, maxCol);
+      const rowData = rng.getValues()[0];
+      
+      rowData[COL_FISCAL.USER - 1] = user;
+      rowData[COL_FISCAL.AMOUNT - 1] = d.amount === "" ? "" : d.amount;
+      rowData[COL_FISCAL.RIDE - 1] = d.rideDate;
+      rowData[COL_FISCAL.FROM - 1] = d.from;
+      rowData[COL_FISCAL.TO - 1] = d.to;
+      
+      const colCompany = findColByHeaderFast_(sh, CONFIG.FISCAL_HEADER_ROW, ["会社名", "会社", "グループ"]);
+      if (colCompany > 0) rowData[colCompany - 1] = d.company || "";
+      
+      rng.setValues([rowData]);
+    }
+  }
+  
+  if (mgmt.MainSheet && mgmt.MainRow) {
+    const ss = ssMain_();
+    const sh = ss.getSheetByName(mgmt.MainSheet);
+    if (sh) {
+      const target = buildTargetText_(d);
+      const maxCol = sh.getMaxColumns();
+      const rng = sh.getRange(mgmt.MainRow, 1, 1, maxCol);
+      const rowData = rng.getValues()[0];
+      
+      rowData[COL_MAIN.TARGET - 1] = target;
+      rowData[COL_MAIN.COMPANY - 1] = d.company || "";
+      if (d.remarks) rowData[COL_MAIN.REMARKS - 1] = d.remarks;
+      
+      rng.setValues([rowData]);
+    }
+  }
+  
+  updateMgmt_(mgmt.row, { Cards: (d.cards || []).join(","), Company: d.company || "", Status: "処理済" });
+
+  if (d.remarks === "払戻" || (d.rawBlock && (d.rawBlock.includes("払戻") || d.rawBlock.includes("払い戻し")))) {
+    if (mgmt.EventId) { deleteEvents_(mgmt.EventId); updateMgmt_(mgmt.row, { EventId: "" }); }
+    return;
+  }
+
+  const t = buildEventTime_(d);
+  const hasUser = d.names && d.names.length > 0;
+  if (t && hasUser) {
+    const evIds = syncCalendarEvents_(mgmt.row, mgmt.EventId || "", d);
+    if (evIds) updateMgmt_(mgmt.row, { EventId: evIds });
+  }
+}
+
+function setMainHeadersIfMissing_(sh) {
+  const hr = CONFIG.MAIN_HEADER_ROW;
+  ensureMainKeyColumn_(sh);
+  const maxCol = sh.getMaxColumns();
+  const headers = sh.getRange(hr, 1, 1, maxCol).getValues()[0];
+  let changed = false;
+  const checkAndSet = (col, text) => {
+    if (!headers[col - 1]) {
+      headers[col - 1] = text;
+      changed = true;
+    }
+  };
+  checkAndSet(COL_MAIN.DATE, "日付");
+  checkAndSet(COL_MAIN.VENDOR, "手配・購入先");
+  checkAndSet(COL_MAIN.AMOUNT, "金額");
+  checkAndSet(COL_MAIN.TARGET, "対象者or拠点");
+  checkAndSet(COL_MAIN.ITEM, "小項目");
+  checkAndSet(COL_MAIN.URL, "URL");
+  checkAndSet(COL_MAIN.COMPANY, "会社名");
+  checkAndSet(COL_MAIN.REMARKS, "備考");
+  checkAndSet(COL_MAIN.KEY, "予約キー");
+  if (changed) {
+    sh.getRange(hr, 1, 1, maxCol).setValues([headers]);
+  }
+}
+
+function findIcCardsByReserveNo_(reserveNo) {
+  if (!reserveNo) return [];
+  const rn = String(reserveNo).trim();
+  const q = 'from:yoyaku@expy.jp subject:(乗車用ICカード指定内容) newer_than:14d "' + rn + '"';
+  const threads = GmailApp.search(q, 0, 10);
+  for (const th of threads) {
+    const msgs = th.getMessages();
+    for (let i = msgs.length - 1; i >= 0; i--) {
+      const m = msgs[i];
+      const subject = m.getSubject() || "";
+      if (!subject.includes("ICカード")) continue;
+      const body = m.getPlainBody() || "";
+      const recs = parseSmartExMessage_(subject, body);
+      for (const r of recs) {
+        if (r.kind !== "ic") continue;
+        const cards = r.cards || [];
+        if (!cards.length) continue;
+        for (const b of (r.blocks || [])) {
+          if (String(b && b.reserveNo ? b.reserveNo : "").trim() === rn) return cards;
+        }
+      }
+    }
+  }
+  return [];
+}
+
+function parseBlock_(text) {
+  const rideStr = pickStr_(text, /乗車日\s*[:：]?\s*(\d{4}年\d{1,2}月\d{1,2}日)/);
+  const rideDate = rideStr ? new Date(rideStr.replace(/[年月]/g, "/").replace("日", "")) : null;
+  const reserveNo = pickStr_(text, /お預かり番号\s*[:：]?\s*(\d+)/);
+  
+  let from = "", depTime = "", train = "", to = "", arrTime = "";
+
+  const reRouteWithTrain = /(.*?)[（(\s]+(\d{1,2}[:：]\d{2})[)）\s]*→\s*(.*?)\s*→\s*(.*?)[（(\s]+(\d{1,2}[:：]\d{2})[)）\s]*/g;
+  const reRouteDirect = /(.*?)[（(\s]+(\d{1,2}[:：]\d{2})[)）\s]*→\s*(.*?)[（(\s]+(\d{1,2}[:：]\d{2})[)）\s]*/g;
+
+  const matchesWithTrain = [...String(text || "").matchAll(reRouteWithTrain)];
+  const matchesDirect = [...String(text || "").matchAll(reRouteDirect)];
+
+  if (matchesWithTrain.length > 0) {
+    const first = matchesWithTrain[0];
+    from = String(first[1] || "").trim();
+    depTime = String(first[2] || "").trim();
+    train = String(first[3] || "").trim();
+    const last = matchesWithTrain[matchesWithTrain.length - 1];
+    to = String(last[4] || "").trim();
+    arrTime = String(last[5] || "").trim();
+  } else if (matchesDirect.length > 0) {
+    const first = matchesDirect[0];
+    from = String(first[1] || "").trim();
+    depTime = String(first[2] || "").trim();
+    train = ""; 
+    const last = matchesDirect[matchesDirect.length - 1];
+    to = String(last[3] || "").trim();
+    arrTime = String(last[4] || "").trim();
+  } else {
+    const routeNoTime = String(text || "").match(/^(.+?)→(.+?)→(.+)$/m);
+    if (routeNoTime) {
+      from = String(routeNoTime[1] || "").trim();
+      train = String(routeNoTime[2] || "").trim();
+      to = String(routeNoTime[3] || "").trim();
+      depTime = ""; arrTime = "";
+    } else {
+      const routeNoTrain = String(text || "").match(/^(.+?)→(.+)$/m);
+      if (routeNoTrain) {
+        from = String(routeNoTrain[1] || "").trim();
+        to = String(routeNoTrain[2] || "").trim();
+        train = ""; depTime = ""; arrTime = "";
+      }
+    }
+  }
+  
+  const amount = pickNumber_(text, /発売額\s*[:：]?\s*([\d,]+)円/);
+  return {
+    reserveNo, rideDate, rideDateStr: rideDate ? Utilities.formatDate(rideDate, Session.getScriptTimeZone(), "yyyy-MM-dd") : "",
+    from, depTime, train, to, arrTime, amount: amount === "" ? "" : amount, diff: "", rawBlock: String(text || "").trim(),
+    cards: [], names: [], bases: [], primaryName: "", cardsMasked: "", company: ""
+  };
+}
+
+function buildEventTitle_(d, overrideName) {
+  const raw0 = String(overrideName || d.primaryName || (d.names || []).join(" ") || "").trim();
+  const rawName = stripLeadingTimeRange_(raw0);
+  const name = rawName ? rawName : "（未設定）";
+  const f = String(d.from || "").trim();
+  const t = String(d.to || "").trim();
+  const title = `${name}さん　新幹線　${f}→${t}`.replace(/\s+/g, " ").trim();
+  return title;
+}
+
+function buildEventTime_(d) {
+  const ride = d && d.rideDate;
+  if (!(ride instanceof Date)) return null;
+  const ds = parseHM_(d.depTime);
+  const as = parseHM_(d.arrTime);
+  if (!ds || !as) return null;
+  if (![ds.h, ds.m, as.h, as.m].every(n => typeof n === "number" && isFinite(n))) return null;
+  if (ds.h < 0 || ds.h > 23 || as.h < 0 || as.h > 23) return null;
+  if (ds.m < 0 || ds.m > 59 || as.m < 0 || as.m > 59) return null;
+  const start = new Date(ride.getTime());
+  const end = new Date(ride.getTime());
+  start.setHours(ds.h, ds.m, 0, 0);
+  end.setHours(as.h, as.m, 0, 0);
+  if (isNaN(start.getTime()) || isNaN(end.getTime())) return null;
+  if (end <= start) end.setDate(end.getDate() + 1);
+  return { start, end };
+}
+
+function parseSmartExMessage_(subject, body) {
+  subject = normalizeSubject_(subject);
+  const b = String(body || "");
+  const isIcSubject = subject.includes("乗車用ICカード指定内容");
+  const isChange = subject.includes("予約変更内容") || b.includes("■変更前の予約内容");
+  const isRefund = subject.includes("払戻内容");
+  const hasReserve = b.includes("■予約内容");
+  const cardSec = extractSection_(b, "■乗車用ICカード");
+  const cards = cardSec ? extractCards_(cardSec) : [];
+  const isRoundTrip = b.includes("【第1行程】");
+
+  if (isRefund) {
+    const refundAmount = pickNumber_(b, /払戻額[は:]?[、，]?\s*([0-9,，]+)円/);
+    const after = parseBlock_(b);
+    after.rawBlock = b.trim();
+    after.cards = cards;
+    if (refundAmount !== "") {
+      after.amount = -1 * Math.abs(refundAmount);
+    }
+    return [{ kind: "refund", after, cards, blocks: [] }];
+  }
+
+  if (isChange) {
+    const afterBlocks = extractAllSections_(b, "■予約内容");
+    const beforeBlocks = extractAllSections_(b, "■変更前の予約内容");
+    const n = Math.max(afterBlocks.length, beforeBlocks.length, 1);
+    const recs = [];
+    for (let i = 0; i < n; i++) {
+      const aTextRaw = afterBlocks[i] || afterBlocks[0] || b;
+      const btRaw = beforeBlocks[i] || beforeBlocks[0] || b;
+      const aText = trimReservationBlock_(aTextRaw);
+      const bt = trimReservationBlock_(btRaw);
+      const after = parseBlock_(aText);
+      const before = parseBlock_(bt);
+      after.rawBlock = aText;
+      before.rawBlock = bt;
+      const diff = pickNumber_(b, /差引\s*([\d,]+)円/);
+      after.diff = diff === "" ? "" : diff;
+      after.cards = cards;
+      recs.push({ kind: "change", before, after, cards, blocks: [] });
+    }
+    return recs;
+  }
+
+  if (isRoundTrip) {
+    const recs = [];
+    const reTrip = /【第\d+行程】[\s\S]?発売額\s[\d,]+\s円/g;
+    const matches = [...b.matchAll(reTrip)];
+    for (const m of matches) {
+      const blockText = m[0];
+      const after = parseBlock_(blockText);
+      after.rawBlock = blockText.trim();
+      after.cards = cards;
+      recs.push({ kind: "new", after, cards, blocks: [] });
+    }
+    if (recs.length > 0) return recs;
+  }
+
+  if (isIcSubject) {
+    const blocks = extractAllSections_(b, "■予約内容");
+    const parsedBlocks = blocks.map(x => parseBlock_(x)).filter(x => x && x.reserveNo);
+    return [{ kind: "ic", cards, blocks: parsedBlocks }];
+  }
+
+  if (hasReserve) {
+    const blocks = extractAllSections_(b, "■予約内容");
+    if (!blocks.length) {
+      const trimmed = trimReservationBlock_(b);
+      const after = parseBlock_(trimmed);
+      after.rawBlock = trimmed.trim();
+      after.cards = cards;
+      return [{ kind: "new", after, cards, blocks: [] }];
+    }
+    return blocks.map(sec => {
+      const trimmed = trimReservationBlock_(sec);
+      const after = parseBlock_(trimmed);
+      after.rawBlock = trimmed.trim();
+      after.cards = cards;
+      return { kind: "new", after, cards, blocks: [] };
+    });
+  }
+
+  const after = parseBlock_(b);
+  after.rawBlock = b.trim();
+  after.cards = cards;
+  return [{ kind: "new", after, cards, blocks: [] }];
+}
+
+function buildGlobalIcByKey_() {
+  const cache = CacheService.getScriptCache();
+  const cacheKey = "SMX_GIC_V1";
+  const hit = cache.get(cacheKey);
+  if (hit) {
+    try {
+      const arr = JSON.parse(hit);
+      const m = new Map();
+      for (const it of (arr || [])) {
+        if (!it || !it.k) continue;
+        m.set(it.k, { cards: it.cards || [], msgId: it.msgId || "", at: it.at ? new Date(it.at) : new Date() });
+      }
+      return m;
+    } catch (_) {}
+  }
+  const q = 'from:yoyaku@expy.jp subject:(乗車用ICカード指定内容) newer_than:1d';
+  const threads = GmailApp.search(q, 0, 50);
+  const out = new Map();
+  for (const th of threads) {
+    for (const m of th.getMessages()) {
+      const subject = m.getSubject() || "";
+      if (!subject.includes("ICカード")) continue;
+      const body = m.getPlainBody() || "";
+      const recs = parseSmartExMessage_(subject, body);
+      for (const r of recs) {
+        if (r.kind !== "ic") continue;
+        const rcards = r.cards || [];
+        if (!rcards.length) continue;
+        for (const b of (r.blocks || [])) {
+          const k = buildPairKey_(b);
+          if (!k) continue;
+          out.set(k, { cards: rcards, msgId: m.getId(), at: m.getDate() });
+        }
+      }
+    }
+  }
+  try {
+    const save = [];
+    for (const [k, v] of out.entries()) {
+      save.push({ k, cards: v.cards || [], msgId: v.msgId || "", at: (v.at instanceof Date) ? v.at.toISOString() : "" });
+    }
+    cache.put(cacheKey, JSON.stringify(save), 3600);
+  } catch (_) {}
+  return out;
+}
+
+function toHalfWidth_(s) {
+  return String(s || "").replace(/[！-～]/g, ch => String.fromCharCode(ch.charCodeAt(0) - 0xFEE0)).replace(/\u3000/g, " ");
+}
+
+function normalizeCardKey_(s) {
+  const x = toHalfWidth_(String(s || "")).toUpperCase();
+  return x.replace(/[\s-‐-‒–—―ー－]/g, "").replace(/[^A-Z0-9]/g, "");
+}
+
+function normalizeCardDigits_(s) {
+  const x = toHalfWidth_(String(s || ""));
+  return x.replace(/[^\d]/g, "");
+}
+
+function countDigits_(s) {
+  const m = String(s || "").match(/\d/g);
+  return m ? m.length : 0;
+}
+
+function extractCards_(text) {
+  let t0 = String(text || "");
+  t0 = t0.replace(/https?:\/\/\S+/g, " ");
+  t0 = t0.replace(/\n?乗車用ICカードを自動改札機にタッチし[\s\S]*$/m, "");
+  t0 = t0.replace(/\n?※乗車方法はこちら[\s\S]*$/m, "");
+  let t = toHalfWidth_(t0).toUpperCase().replace(/[‐-‒–—―ー－−]/g, "-").replace(/\s*-\s*/g, "-");
+  const out = new Set();
+  const msNum = t.match(/\b\d{10,20}\b/g) || [];
+  for (const s of msNum) {
+    const d = String(s).replace(/[^\d]/g, "");
+    if (d.length >= 10) out.add(d);
+  }
+  const msAlpha = t.match(/\b[A-Z0-9]{10,24}\b/g) || [];
+  for (const tok of msAlpha) {
+    const k = normalizeCardKey_(tok);
+    if (!k) continue;
+    if (countDigits_(k) < 10) continue;
+    out.add(k);
+  }
+  const msHyphen = t.match(/\b[A-Z0-9]{2,12}(?:-[A-Z0-9]{2,12}){2,8}\b/g) || [];
+  for (const tok of msHyphen) {
+    const k = normalizeCardKey_(tok);
+    if (!k) continue;
+    if (countDigits_(k) < 10) continue;
+    out.add(k);
+  }
+  const alphaKeys = Array.from(out).filter(v => /[A-Z]/.test(String(v)));
+  if (alphaKeys.length) {
+    for (const v of Array.from(out)) {
+      const s = String(v);
+      if (/[A-Z]/.test(s)) continue;
+      if (!/^\d{10,20}$/.test(s)) continue;
+      const hit = alphaKeys.some(k => String(k).includes(s));
+      if (hit) out.delete(s);
+    }
+  }
+  return Array.from(out);
+}
+
+function extractAllSections_(body, header) {
+  const out = [];
+  const b = String(body || "");
+  let idx = 0;
+  while (true) {
+    const p = b.indexOf(header, idx);
+    if (p < 0) break;
+    const rest = b.slice(p);
+    const m = rest.match(/^[\s\S]*?(?=\n■|$)/);
+    const sec = m ? m[0] : rest;
+    out.push(sec);
+    idx = p + header.length;
+  }
+  return out;
+}
+
+function extractSection_(body, header) {
+  const idx = String(body || "").indexOf(header);
+  if (idx < 0) return "";
+  const rest = String(body || "").slice(idx);
+  const m = rest.match(/^[\s\S]*?(?=\n■|$)/);
+  return m ? m[0] : rest;
+}
+
+function isFreeSeatNoTime_(text) {
+  const s = String(text || "");
+  const hasFree = /自由席/.test(s);
+  const hasTime = /\b\d{1,2}:\d{2}\b/.test(s);
+  return hasFree && !hasTime;
+}
+
+function isValidDate_(d) {
+  return d instanceof Date && !isNaN(d.getTime());
+}
+
+function isReasonableRideDate_(d) {
+  if (!d || !(d instanceof Date) || isNaN(d.getTime())) return false;
+  const y = d.getFullYear();
+  return y >= 2000 && y <= 2100;
+}
+
+function backfillFromIc_(block, cards, msgDate, threadLink) {
+  const reserveNo = String(block && block.reserveNo ? block.reserveNo : "").trim();
+  if (!reserveNo) return;
+  const rideDateStr = String(block && block.rideDateStr ? block.rideDateStr : "").trim();
+  let sel = findMgmtRowForChange_("", reserveNo, msgDate, rideDateStr);
+  if (!sel || !sel.row) {
+    const rowOnly = findMgmtRowByReserveNoOnly_(reserveNo);
+    if (rowOnly) {
+      sel = { row: rowOnly };
+    }
+  }
+  if (!sel || !sel.row) return;
+  const mgmt = readMgmtByRow_(sel.row);
+  const resolved = resolveCards_(cards || []);
+  const rideDate = isReasonableRideDate_(block && block.rideDate) ? block.rideDate : inferRideDate_(mgmt);
+  if (!isReasonableRideDate_(rideDate)) return;
+  const d = rebuildDataFromMgmt_(mgmt, resolved, resolved.company, rideDate);
+  d.cards = cards || [];
+  d.company = resolved.company || "";
+  d.names = resolved.names || [];
+  d.bases = resolved.bases || [];
+  d.primaryName = d.names.length ? d.names[0] : "";
+  d.cardsMasked = maskCards_(d.cards);
+  updateExistingRecord_(mgmt, d, msgDate, threadLink);
+  updateMgmt_(mgmt.row, {
+    Cards: (d.cards || []).join(","),
+    Company: d.company || "",
+    Status: "処理済",
+    ThreadLink: String(threadLink || "")
+  });
+  audit_("ICバックフィル", reserveNo, mgmt.MainSheet, mgmt.MainRow, "OK", "氏名補完実行(Fallback含む)");
+}
+
+function findMgmtRowByReserveNoOnly_(reserveNo) {
+  const ss = ssLog_();
+  const sh = ss.getSheetByName(CONFIG.MGMT_SHEET);
+  const lastRow = sh.getLastRow();
+  if (lastRow < 2) return null;
+  const cNo = mgCol_("お預かり番号");
+  const nos = sh.getRange(2, cNo, lastRow - 1, 1).getValues().flat().map(v => String(v || ""));
+  const target = String(reserveNo);
+  for (let i = nos.length - 1; i >= 0; i--) {
+    if (nos[i] === target) {
+      return i + 2;
+    }
+  }
+  return null;
+}
+
+function logFreeSeatNoTime_(ctx, originalBody) {
+  try {
+    const msgId = String(ctx && ctx.msgId ? ctx.msgId : "");
+    const blockIndex = Number(ctx && ctx.blockIndex ? ctx.blockIndex : 1);
+    const key = "MSGID:" + msgId + "#B:" + blockIndex;
+    if (shouldSuppressNotify_("FREESEAT_LOG", key, 86400)) return;
+    const ss = ssLog_();
+    let sh = ss.getSheetByName(CONFIG.FREE_SEAT_SHEET);
+    if (!sh) {
+      sh = ss.insertSheet(CONFIG.FREE_SEAT_SHEET);
+      sh.appendRow(["記録日時", "GmailMsgId", "ThreadId", "受信日時", "件名", "お預かり番号", "乗車日", "発", "着", "URL", "本文抜粋"]);
+    }
+    const snip = String((ctx && ctx.rawBlock) ? ctx.rawBlock : (originalBody || "")).slice(0, 4000);
+    sh.appendRow([
+      new Date(), String(ctx && ctx.msgId ? ctx.msgId : ""), String(ctx && ctx.threadId ? ctx.threadId : ""),
+      (ctx && ctx.msgDate instanceof Date) ? ctx.msgDate : "", String(ctx && ctx.subject ? ctx.subject : ""),
+      String(ctx && ctx.reserveNo ? ctx.reserveNo : ""), String(ctx && ctx.rideDateStr ? ctx.rideDateStr : ""),
+      String(ctx && ctx.from ? ctx.from : ""), String(ctx && ctx.to ? ctx.to : ""),
+      String(ctx && ctx.threadLink ? ctx.threadLink : ""), snip
+    ]);
+  } catch (_) { }
+}
+
+function assertParsed_(parsed, body, thread, msgId, ctx) {
+  const x = parsed.after;
+  const miss = [];
+  if (!x.reserveNo) miss.push("お預かり番号");
+  if (!x.rideDate) miss.push("乗車日");
+  if (!x.from) miss.push("発");
+  if (!x.to) miss.push("着");
+  if (!x.depTime) miss.push("出発時刻");
+  if (!x.arrTime) miss.push("到着時刻");
+  if (x.amount === "") miss.push("発売額");
+
+  const freeSeat = isFreeSeatNoTime_(x.rawBlock || "");
+  if (freeSeat) {
+    const filtered = miss.filter(v => v !== "出発時刻" && v !== "到着時刻");
+    miss.length = 0;
+    for (const v of filtered) miss.push(v);
+  }
+
+  if (miss.length) {
+    addLabel_(thread, CONFIG.LABEL_QUARANTINE);
+    addLabel_(thread, CONFIG.LABEL_Q_PARSER);
+    logParserAnomaly_(miss.join(" / "), x.reserveNo, String(body || "").slice(0, 1200));
+    incParserFail_(msgId);
+    notifyAdminError_("【スマートEX】書式変更/不足項目: " + miss.join(" / "), makeCandidateLink_(), msgId);
+    throw new Error("Parser failed");
+  }
+  if (freeSeat) logFreeSeatNoTime_(ctx || {}, body);
+  resetParserFail_();
+}
+
+function buildPairKey_(p) {
+  if (!p || !p.rideDateStr) return "";
+  return ["P", p.reserveNo || "", p.rideDateStr || "", p.from || "", normalizeHM_(p.depTime), p.to || "", normalizeHM_(p.arrTime)]
+    .map(v => String(v || "").trim()).join("|");
+}
+
+function buildSignature_(p) {
+  if (!p) return "";
+  const parts = ["SMX", p.rideDateStr || "", p.from || "", normalizeHM_(p.depTime), p.to || "", normalizeHM_(p.arrTime), p.train || "", (p.amount === "" ? "" : String(p.amount))]
+    .map(v => String(v || "").trim());
+  return parts.join("|");
+}
+
+function signatureSansAmount_(signature) {
+  const s = String(signature || "");
+  if (!s) return "";
+  const parts = s.split("|");
+  if (parts.length <= 1) return s;
+  parts.pop();
+  return parts.join("|");
+}
+
+function buildReservationKey_(signature, threadId, msgId, blockIndex) {
+  return String(signature || "") + "#" + String(threadId || "") + "#" + String(msgId || "") + "#" + String(blockIndex || 1);
+}
+
+function resolveCards_(cards) {
+  const master = loadEmployeeMaster_();
+  const names = [];
+  const companies = new Set();
+  const missing = [];
+  const bases = [];
+  for (const c of (cards || [])) {
+    const raw = toHalfWidth_(String(c || "")).toUpperCase();
+    const hasAlpha = /[A-Z]/.test(raw);
+    const kExact = normalizeCardKey_(c);
+    const kDigits = hasAlpha ? "" : normalizeCardDigits_(c);
+    if (!kExact && !kDigits) continue;
+    let hit = null;
+    if (kExact && master.exact.has(kExact)) hit = master.exact.get(kExact);
+    else if (kDigits) {
+      const ent = master.digits.get(kDigits);
+      if (ent && ent.ambiguous) { missing.push(kDigits); continue; }
+      if (ent && ent.records && ent.records.length === 1) hit = ent.records[0];
+    }
+    if (!hit) { missing.push(kExact || kDigits); continue; }
+    names.push(hit.name);
+    bases.push(hit.base);
+    const comp = baseToCompany_(hit.base);
+    if (comp) companies.add(comp);
+  }
+  const uniqNames = Array.from(new Set(names));
+  const uniqBases = Array.from(new Set(bases));
+  const companyList = Array.from(companies).sort();
+  const companyLabel = companyList.length === 0 ? "" : companyList.length === 1 ? companyList[0] : companyList.join("+");
+  return { names: uniqNames, bases: uniqBases, company: companyLabel, multiCompany: companyList.length >= 2, missing };
+}
+
+function baseToCompany_(base) {
+  const b = String(base || "").trim();
+  const hope = new Set(["神戸", "大阪", "京都"]);
+  if (hope.has(b)) return "HOPE";
+  const prd = new Set(["本社", "札幌", "仙台", "大宮", "横浜", "名古屋", "広島", "福岡"]);
+  if (prd.has(b)) return "PRD";
+  return "LIBERTY";
+}
+
+function loadEmployeeMaster_() {
+  const ss = ssLog_();
+  const sh = ss.getSheetByName(CONFIG.EMP_SHEET);
+  if (!sh) throw new Error("社員情報シートが見つかりません: " + CONFIG.EMP_SHEET);
+  const lastRow = sh.getLastRow();
+  const lastCol = sh.getLastColumn();
+  if (lastRow < 2) return { exact: new Map(), digits: new Map() };
+  const headers = sh.getRange(1, 1, 1, lastCol).getValues()[0].map(v => String(v || ""));
+  const idxBase = headerIndexFlex_(headers, ["拠点"]);
+  const idxName = headerIndexFlex_(headers, ["名前", "氏名"]);
+  const idxCard = headerIndexFlex_(headers, ["ＩＣカード番号", "ICカード番号", "ICカード", "カード番号"]);
+  if (idxBase < 0 || idxName < 0 || idxCard < 0) throw new Error("社員情報の必須列が特定できません（拠点/名前/ICカード番号）");
+  const values = sh.getRange(2, 1, lastRow - 1, lastCol).getValues();
+  const exact = new Map();
+  const digits = new Map();
+  const addDigits = (k, rec) => {
+    if (!k) return;
+    const cur = digits.get(k);
+    if (!cur) { digits.set(k, { ambiguous: false, records: [rec] }); return; }
+    const same = cur.records.some(x => x.name === rec.name && x.base === rec.base);
+    if (same) return;
+    cur.records.push(rec);
+    cur.ambiguous = cur.records.length >= 2;
+    digits.set(k, cur);
+  };
+  for (const row of values) {
+    const base = String(row[idxBase] || "").trim();
+    const name = String(row[idxName] || "").trim();
+    const raw = String(row[idxCard] || "");
+    if (!base || !name || !raw) continue;
+    const kExact = normalizeCardKey_(raw);
+    const kDigits = normalizeCardDigits_(raw);
+    if (!kExact && !kDigits) continue;
+    const rec = { base, name, key: kExact, digits: kDigits };
+    if (kExact) exact.set(kExact, rec);
+    if (kDigits) addDigits(kDigits, rec);
+  }
+  return { exact, digits };
+}
+
+function headerIndexFlex_(headers, candidates) {
+  const norm = headers.map(h => normalizeHeader_(h));
+  for (const c of candidates) {
+    const needle = normalizeHeader_(c);
+    const idx = norm.indexOf(needle);
+    if (idx >= 0) return idx;
+  }
+  return -1;
+}
+
+function normalizeHeader_(s) {
+  return String(s || "").replace(/\s+/g, "").replace(/[Ａ-Ｚａ-ｚ０-９]/g, ch => String.fromCharCode(ch.charCodeAt(0) - 0xFEE0)).replace(/ＩＣ/g, "IC").toUpperCase();
+}
+
+function maskCards_(cards) {
+  const out = [];
+  for (const c of (cards || [])) {
+    const d = normalizeCardDigits_(c);
+    if (!d) continue;
+    out.push("****" + d.slice(-4));
+  }
+  return Array.from(new Set(out)).join(",");
+}
+
+function ymKey_(d) {
+  const y = d.getFullYear();
+  const m = String(d.getMonth() + 1).padStart(2, "0");
+  return `${y}/${m}-`;
+}
+
+function parseYmSheetName_(name) {
+  const m = String(name || "").match(/^(\d{4})\/(\d{2})-$/);
+  if (!m) return null;
+  const y = Number(m[1]);
+  const mo = Number(m[2]);
+  if (!Number.isFinite(y) || !Number.isFinite(mo) || mo < 1 || mo > 12) return null;
+  return new Date(y, mo - 1, 1, 0, 0, 0, 0);
+}
+
+function addMonths_(d, n) {
+  const x = new Date(d.getTime());
+  const y = x.getFullYear();
+  const m = x.getMonth();
+  x.setFullYear(y, m + n, 1);
+  x.setHours(0, 0, 0, 0);
+  return x;
+}
+
+function findMainPeriodSheetForDate_(ss, rideDate) {
+  const target = (rideDate instanceof Date) ? new Date(rideDate.getTime()) : new Date(rideDate);
+  if (isNaN(target.getTime())) return null;
+  target.setHours(0, 0, 0, 0);
+  const candidates = [];
+  for (const sh of ss.getSheets()) {
+    const start = parseYmSheetName_(sh.getName());
+    if (!start) continue;
+    const end = addMonths_(start, 12);
+    if (target.getTime() >= start.getTime() && target.getTime() < end.getTime()) candidates.push({ sh, start });
+  }
+  if (!candidates.length) return null;
+  candidates.sort((a, b) => b.start.getTime() - a.start.getTime());
+  return candidates[0].sh;
+}
+
+function findLatestMainTemplate_(ss) {
+  const candidates = [];
+  for (const sh of ss.getSheets()) {
+    const start = parseYmSheetName_(sh.getName());
+    if (!start) continue;
+    candidates.push({ sh, start });
+  }
+  if (!candidates.length) return null;
+  candidates.sort((a, b) => b.start.getTime() - a.start.getTime());
+  return candidates[0].sh;
+}
+
+function createNextMainSheetFromLatest_(ss, newName) {
+  const tpl = findLatestMainTemplate_(ss);
+  let sh = null;
+  if (tpl) {
+    const copy = tpl.copyTo(ss);
+    try { copy.setName(newName); sh = copy; } catch (e) { ss.deleteSheet(copy); throw e; }
+  } else {
+    try { sh = ss.insertSheet(newName); } catch (e) { throw e; }
+  }
+  ensureMainKeyColumn_(sh);
+  const maxRows = sh.getMaxRows();
+  const lastCol = sh.getLastColumn();
+  const startRow = CONFIG.MAIN_DATA_START_ROW;
+  if (maxRows >= startRow && lastCol > 0) sh.getRange(startRow, 1, maxRows - startRow + 1, lastCol).clearContent();
+  setMainHeadersIfMissing_(sh);
+  return sh;
+}
+
+function getOrCreateMainSheet_(rideDate) {
+  const targetDate = rideDate instanceof Date ? rideDate : new Date(rideDate);
+  if (!isReasonableRideDate_(targetDate)) {
+    throw new Error("Cannot create Main Sheet: Invalid/Unreasonable Date (" + targetDate + ")");
+  }
+  const ss = ssMain_();
+  const hit = findMainPeriodSheetForDate_(ss, targetDate);
+  if (hit) {
+    ensureMainKeyColumn_(hit);
+    setMainHeadersIfMissing_(hit);
+    return hit;
+  }
+  const newName = ymKey_(targetDate);
+  let exists = ss.getSheetByName(newName);
+  if (exists) {
+    ensureMainKeyColumn_(exists);
+    setMainHeadersIfMissing_(exists);
+    return exists;
+  }
+  return createNextMainSheetFromLatest_(ss, newName);
+}
+
+function ensureMainKeyColumn_(sh) {
+  const needCol = COL_MAIN.KEY;
+  const curCols = sh.getMaxColumns();
+  if (curCols < needCol) sh.insertColumnsAfter(curCols, needCol - curCols);
+}
+
+function findNextMainRow_(sh) {
+  const start = CONFIG.MAIN_DATA_START_ROW;
+  const last = Math.max(sh.getLastRow(), start);
+  const rng = sh.getRange(start, COL_MAIN.DATE, last - start + 1, 1).getValues().flat();
+  for (let i = 0; i < rng.length; i++) {
+    if (!rng[i]) return start + i;
+  }
+  return last + 1;
+}
+
+function buildTargetText_(d) {
+  const names = (d.names || []).map(x => String(x || "").trim()).filter(Boolean);
+  if (names.length) return names.join(" ");
+  const bases = (d.bases || []).map(x => String(x || "").trim()).filter(Boolean);
+  if (bases.length) return bases.join(" ");
+  return "";
+}
+
+function getFiscalSheetName_(d) {
+  const year = d.getFullYear();
+  const month = d.getMonth() + 1;
+  const startYear = (month === 12) ? year : (year - 1);
+  return `新幹線 ${startYear}/12-`;
+}
+
+function getOrCreateFiscalSheet_(d) {
+  if (!isReasonableRideDate_(d)) throw new Error("Invalid date for fiscal sheet creation: " + d);
+  const ss = ssLog_();
+  const name = getFiscalSheetName_(d);
+  let sh = ss.getSheetByName(name);
+  if (sh) return sh;
+  const tpl = ss.getSheetByName(CONFIG.TEMPLATE_FISCAL_SHEET);
+  if (!tpl) throw new Error("テンプレートシートが見つかりません: " + CONFIG.TEMPLATE_FISCAL_SHEET);
+  const copy = tpl.copyTo(ss);
+  try { copy.setName(name); sh = copy; } catch (e) { ss.deleteSheet(copy); throw e; }
+  const startRow = CONFIG.FISCAL_DATA_START_ROW;
+  const maxRows = sh.getMaxRows();
+  const lastCol = sh.getLastColumn();
+  if (maxRows >= startRow && lastCol > 0) sh.getRange(startRow, 1, maxRows - startRow + 1, lastCol).clearContent();
+  ensureFiscalKeyColumn_(sh);
+  return sh;
+}
+
+function ensureFiscalKeyColumn_(sh) {
+  const needCol = CONFIG.FISCAL_KEY_COL;
+  const curCols = sh.getMaxColumns();
+  if (curCols < needCol) sh.insertColumnsAfter(curCols, needCol - curCols);
+  const headerRow = CONFIG.FISCAL_HEADER_ROW;
+  const headerCell = sh.getRange(headerRow, needCol).getValue();
+  if (!headerCell) sh.getRange(headerRow, needCol).setValue(CONFIG.FISCAL_KEY_HEADER);
+}
+
+function findFiscalNextRow_(sh) {
+  const start = CONFIG.FISCAL_DATA_START_ROW;
+  const last = Math.max(sh.getLastRow(), start);
+  const rng = sh.getRange(start, COL_FISCAL.ORDER, last - start + 1, 1).getValues().flat();
+  for (let i = 0; i < rng.length; i++) {
+    if (!rng[i]) return start + i;
+  }
+  return last + 1;
+}
+
+function getBillingMonth_(d) {
+  const m = d.getMonth() + 2;
+  return (m === 13 ? 1 : m) + "月";
+}
+
+function stripLeadingTimeRange_(s) {
+  let x = String(s || "").replace(/\u00A0/g, " ").replace(/\u3000/g, " ").trim();
+  x = x.replace(/^\d{1,2}:\d{2}\s*[‐-‒–—―ー－−]\s*\d{1,2}:\d{2}\s*/g, "");
+  x = x.replace(/\s+/g, " ").trim();
+  return x;
+}
+
+function ensureAll_() {
+  ensureDoneSheet_();
+  ensureAuditSheets_();
+  ensureMgmtSheet_();
+  ensureQueueSheet_();
+  ensureDashboardSheet_();
+  ensureOverrideSheet_();
+}
+
+function ssMain_() { return SpreadsheetApp.openById(CONFIG.MAIN_SPREADSHEET_ID); }
+function ssLog_() {
+  if (!CONFIG.LOG_SPREADSHEET_ID) return SpreadsheetApp.getActive();
+  return SpreadsheetApp.openById(CONFIG.LOG_SPREADSHEET_ID);
+}
+
+function ensureDoneSheet_() { ensureDoneSheetRotated_(); }
+
+function isMsgDone_(msgId) {
+  const id = String(msgId || "").trim();
+  if (!id) return false;
+  const sheets = getDoneSheetsForLookup_();
+  for (const sh of sheets) {
+    const lastRow = sh.getLastRow();
+    if (lastRow < 2) continue;
+    const vals = sh.getRange(2, 1, lastRow - 1, 1).getValues();
+    for (let i = 0; i < vals.length; i++) {
+      if (String(vals[i][0] || "").trim() === id) return true;
+    }
+  }
+  return false;
+}
+
+function markMsgDone_(msgId, threadId) {
+  const ss = ssLog_();
+  const y = new Date().getFullYear();
+  const name = doneSheetNameByYear_(y);
+  let sh = ss.getSheetByName(name);
+  if (!sh) { ensureDoneSheetRotated_(); sh = ss.getSheetByName(name); }
+  sh.appendRow([String(msgId), String(threadId || ""), new Date()]);
+}
+
+function ensureMgmtSheet_() {
+  const ss = ssLog_();
+  let sh = ss.getSheetByName(CONFIG.MGMT_SHEET);
+  const need = ["お預かり番号", "状態", "更新日時", "MainSheet", "MainRow", "FiscalSheet", "FiscalRow", "EventId", "出発時刻", "到着時刻", "発", "着", "乗車日", "予約本文ブロック", "ICカード", "会社", "予約署名", "初回受信日時", "GmailMsgId", "ThreadId", "ThreadLink", "予約キー", "Lastuser"];
+  if (!sh) {
+    sh = ss.insertSheet(CONFIG.MGMT_SHEET);
+    sh.appendRow(need);
+    invalidateMgmtColCache_();
+    return;
+  }
+  const headers = sh.getRange(1, 1, 1, sh.getLastColumn()).getValues()[0].map(v => String(v || ""));
+  for (const h of need) {
+    if (!headers.includes(h)) sh.getRange(1, sh.getLastColumn() + 1).setValue(h);
+  }
+  invalidateMgmtColCache_();
+}
+
+function mgCol_(name) {
+  primeMgmtColCache_();
+  const idx = __MG_COL_CACHE ? __MG_COL_CACHE[String(name || "")] : 0;
+  if (!idx) throw new Error("管理シート列が見つかりません: " + name);
+  return idx;
+}
+
+function readMgmtByRow_(r) {
+  const ss = ssLog_();
+  const sh = ss.getSheetByName(CONFIG.MGMT_SHEET);
+  const get = (name) => {
+    const c = mgCol_(name);
+    return sh.getRange(r, c).getValue();
+  };
+  return {
+    row: r, ReserveNo: String(get("お預かり番号") || ""), Status: String(get("状態") || ""), UpdatedAt: get("更新日時"),
+    MainSheet: String(get("MainSheet") || ""), MainRow: Number(get("MainRow") || 0), FiscalSheet: String(get("FiscalSheet") || ""),
+    FiscalRow: Number(get("FiscalRow") || 0), EventId: String(get("EventId") || ""), Dep: String(get("出発時刻") || ""),
+    Arr: String(get("到着時刻") || ""), From: String(get("発") || ""), To: String(get("着") || ""), RideDate: get("乗車日"),
+    Block: String(get("予約本文ブロック") || ""), Cards: String(get("ICカード") || ""), Company: String(get("会社") || ""),
+    Signature: String(get("予約署名") || ""), FirstSeen: get("初回受信日時"), MsgId: String(get("GmailMsgId") || ""),
+    ThreadId: String(get("ThreadId") || ""), ThreadLink: String(get("ThreadLink") || ""), Key: String(get("予約キー") || ""), Lastuser: String(get("Lastuser") || "")
+  };
+}
+
+function getMgmtByKey_(key) {
+  const ss = ssLog_();
+  const sh = ss.getSheetByName(CONFIG.MGMT_SHEET);
+  if (!sh) throw new Error("MGMTシートが見つかりません: " + CONFIG.MGMT_SHEET);
+  const keyNorm = String(key || "").trim();
+  if (!keyNorm) return null;
+  const c = mgCol_("予約キー");
+  const lastRow = sh.getLastRow();
+  if (lastRow < 2) return null;
+  const rng = sh.getRange(2, c, lastRow - 1, 1);
+  const hits = rng.createTextFinder(keyNorm).matchEntireCell(true).findAll();
+  if (!hits || hits.length === 0) return null;
+  const row = hits[hits.length - 1].getRow();
+  return readMgmtByRow_(row);
+}
+
+function trimReservationBlock_(sec) {
+  let s = String(sec || "").trim();
+  const guideMatch = s.match(/(?:^|\n)\s*[（(]ご案内[）)]/);
+  if (guideMatch) s = s.slice(0, guideMatch.index).trim();
+  const m = s.match(/発売額\s*[0-9,]+\s*円/);
+  if (!m) return s;
+  const idx = s.indexOf(m[0]);
+  if (idx < 0) return s;
+  return s.slice(0, idx + m[0].length).trim();
+}
+
+function findMgmtRowForChange_(signature, reserveNo, changeMailDate, rideDateStr) {
+  const ss = ssLog_();
+  const sh = ss.getSheetByName(CONFIG.MGMT_SHEET);
+  const lastRow = sh.getLastRow();
+  if (lastRow < 2) return { row: null };
+  const ref = (changeMailDate instanceof Date) ? changeMailDate : new Date(changeMailDate);
+  const rideKey = normalizeDateStr_(rideDateStr);
+  const cNo = mgCol_("お預かり番号");
+  const cRide = mgCol_("乗車日");
+  const cFirst = mgCol_("初回受信日時");
+
+  if (reserveNo && rideKey) {
+    const nos = sh.getRange(2, cNo, lastRow - 1, 1).getValues().flat().map(v => String(v || ""));
+    const rides = sh.getRange(2, cRide, lastRow - 1, 1).getValues().flat();
+    const firsts = sh.getRange(2, cFirst, lastRow - 1, 1).getValues().flat();
+    const candidates = [];
+    for (let i = 0; i < nos.length; i++) {
+      if (nos[i] !== String(reserveNo)) continue;
+      const rk = normalizeDateStr_(rides[i]);
+      if (rk !== rideKey) continue;
+      const r = i + 2;
+      const firstSeen = (firsts[i] instanceof Date) ? firsts[i] : new Date(firsts[i]);
+      const delta = Math.abs(ref.getTime() - firstSeen.getTime());
+      if (firstSeen.getTime() <= ref.getTime()) {
+        candidates.push({ row: r, delta: delta });
+      }
+    }
+    if (candidates.length > 0) {
+      candidates.sort((a, b) => a.delta - b.delta);
+      return { row: candidates[0].row };
+    }
+  }
+
+  const cSig = mgCol_("予約署名");
+  const sigs = sh.getRange(2, cSig, lastRow - 1, 1).getValues().flat().map(v => String(v || ""));
+  const firsts = sh.getRange(2, cFirst, lastRow - 1, 1).getValues().flat();
+  const sigExact = String(signature || "");
+  const candidates = [];
+  for (let i = 0; i < sigs.length; i++) {
+    if (sigs[i] !== sigExact) continue;
+    const r = i + 2;
+    const firstSeen = (firsts[i] instanceof Date) ? firsts[i] : new Date(firsts[i]);
+    const delta = Math.abs(ref.getTime() - firstSeen.getTime());
+    if (firstSeen.getTime() <= ref.getTime()) {
+      candidates.push({ row: r, delta: delta });
+    }
+  }
+  if (candidates.length > 0) {
+    candidates.sort((a, b) => a.delta - b.delta);
+    return { row: candidates[0].row };
+  }
+  return { row: null };
+}
+
+function applyChange_(mgmt, d, msgId, msgDate, threadLink) {
+  const logSS = ssLog_();
+  updateMgmt_(mgmt.row, {
+    Status: "変更あり", Dep: normalizeHM_(d.depTime), Arr: normalizeHM_(d.arrTime),
+    From: d.from || "", To: d.to || "", RideDate: d.rideDate || "", Block: d.rawBlock,
+    Cards: (d.cards || []).join(","), Company: d.company || "", ThreadLink: String(threadLink || "")
+  });
+
+  if (mgmt.MainSheet && mgmt.MainRow) {
+    try {
+      const mainSS = ssMain_();
+      const mainSh = mainSS.getSheetByName(mgmt.MainSheet);
+      if (mainSh) {
+        ensureMainKeyColumn_(mainSh);
+        mainSh.getRange(mgmt.MainRow, COL_MAIN.KEY).setValue(mgmt.Key);
+      }
+    } catch(e) {
+      console.warn("MainSheet key update failed", e);
+    }
+  }
+
+  const ch = logSS.getSheetByName(CONFIG.CHANGELOG_SHEET);
+  if (ch) ch.appendRow([new Date(), d.reserveNo, d.diff === "" ? "" : d.diff, String(msgId || "")]);
+  
+  const t = buildEventTime_(d);
+  const hasUser = d.names && d.names.length > 0;
+  if (t && hasUser) {
+    const evIds = syncCalendarEvents_(mgmt.row, mgmt.EventId || "", d);
+    if (evIds) {
+      updateMgmt_(mgmt.row, { EventId: evIds, Status: "処理済" });
+      notifyAdminSuccessOnce_("【スマートEX】カレンダー更新（変更反映）完了", `複数名予定更新\n\n${makeCandidateLink_()}`);
+    }
+  } else {
+    if (isFreeSeatNoTime_(d.rawBlock)) {
+      logFreeSeatNoTime_({
+        subject: "", msgId: msgId || "", msgDate: msgDate instanceof Date ? msgDate : new Date(msgDate), threadId: mgmt.ThreadId || "",
+        threadLink: String(threadLink || ""), blockIndex: 1, reserveNo: d.reserveNo || "", rideDateStr: d.rideDateStr || "",
+        from: d.from || "", to: d.to || "", depTime: d.depTime || "", arrTime: d.arrTime || "", amount: d.amount === "" ? "" : d.amount, rawBlock: d.rawBlock || ""
+      }, d.rawBlock || "");
+    }
+    updateMgmt_(mgmt.row, { Status: "処理済" });
+    if (!hasUser) {
+      audit_("変更反映(委託)", d.reserveNo, mgmt.MainSheet, mgmt.MainRow, "OK", "calendar skipped / main update skipped");
+    } else {
+      audit_("変更反映", d.reserveNo, mgmt.MainSheet, mgmt.MainRow, "OK", "main update skipped");
+    }
+  }
+}
+
+// -------------------------------------------------------------------------
+// カレンダー複数名対応モジュール
+// -------------------------------------------------------------------------
+function syncCalendarEvents_(mgmtRow, existingEventIdsStr, d) {
+  const t = buildEventTime_(d);
+  if (!t || !d.names || d.names.length === 0) return "";
+  
+  const existingIds = String(existingEventIdsStr || "").split(",").filter(Boolean);
+  const newIds = [];
+  
+  for (let i = 0; i < d.names.length; i++) {
+    const name = d.names[i];
+    const title = buildEventTitle_(d, name);
+    const existingId = existingIds[i] || "";
+    
+    // Google Calendar APIの連続アクセス制限を回避するための待機処理
+    if (i > 0) {
+      Utilities.sleep(3000);
+    }
+    
+    const evId = upsertEventSafe_(mgmtRow, existingId, title, t, d.rawBlock);
+    if (evId) newIds.push(evId);
+  }
+  
+  for (let i = d.names.length; i < existingIds.length; i++) {
+    deleteEvent_(existingIds[i]);
+  }
+  
+  return newIds.join(",");
+}
+
+function deleteEvents_(eventIdStr) {
+  if (!eventIdStr) return;
+  const ids = String(eventIdStr).split(",").filter(Boolean);
+  try {
+    const cal = CalendarApp.getCalendarById(CONFIG.CALENDAR_ID);
+    for (const id of ids) {
+      try {
+        const ev = cal.getEventById(id);
+        if (ev) ev.deleteEvent();
+        Utilities.sleep(3000);
+      } catch (e) {
+        console.warn("Event delete failed for id: " + id, e);
+      }
+    }
+  } catch (e) {
+    console.warn("Calendar get failed", e);
+  }
+}
+
+function deleteEvent_(eventId) {
+  deleteEvents_(eventId);
+}
+
+function upsertEventSafe_(mgmtRow, eventId, title, timeObj, desc) {
+  try {
+    if (!timeObj || !(timeObj.start instanceof Date) || !(timeObj.end instanceof Date) || isNaN(timeObj.start.getTime()) || isNaN(timeObj.end.getTime())) {
+      throw new Error("timeObj invalid");
+    }
+    const id = upsertEvent_(eventId, title, timeObj.start, timeObj.end, desc);
+    return id;
+  } catch (err) {
+    const msg = String(err && err.stack ? err.stack : err);
+    if (String(err && err.message ? err.message : err).includes("timeObj invalid")) {
+      audit_("カレンダー更新", "", "", "", "NG", "time invalid: " + msg);
+      notifyAdminError_("【スマートEX】カレンダー時刻が不正のため更新をスキップ（要確認）\n" + msg, makeCandidateLink_(), "");
+      return "";
+    }
+    enqueueRetry_("calendar_upsert", mgmtRow, eventId, title, timeObj && timeObj.start ? timeObj.start : new Date(), timeObj && timeObj.end ? timeObj.end : new Date(), desc, msg);
+    notifyAdminError_("【スマートEX】カレンダー更新に失敗（再試行キューに登録）\n" + msg, makeQueueLink_(), "");
+    return "";
+  }
+}
+
+function upsertEvent_(id, title, start, end, desc) {
+  const cal = CalendarApp.getCalendarById(CONFIG.CALENDAR_ID);
+  let ev = id ? cal.getEventById(id) : null;
+  if (ev) {
+    ev.setTitle(title).setTime(start, end).setDescription(desc).setColor(CONFIG.CALENDAR_COLOR);
+    return id;
+  }
+  ev = cal.createEvent(title, start, end, { description: desc });
+  ev.setColor(CONFIG.CALENDAR_COLOR);
+  return ev.getId();
+}
+
+function ensureQueueSheet_() {
+  const ss = ssLog_();
+  let sh = ss.getSheetByName(CONFIG.QUEUE_SHEET);
+  if (!sh) {
+    sh = ss.insertSheet(CONFIG.QUEUE_SHEET);
+    sh.appendRow(["作成日時", "種別", "管理行", "EventID", "件名", "開始", "終了", "本文", "試行回数", "次回実行", "最終エラー", "状態"]);
+  }
+}
+
+function enqueueRetry_(type, mgmtRow, eventId, title, start, end, desc, lastError) {
+  const ss = ssLog_();
+  const sh = ss.getSheetByName(CONFIG.QUEUE_SHEET);
+  const now = new Date();
+  const nextAt = new Date(now.getTime() + 2 * 60 * 1000);
+  const s = (start instanceof Date) ? start : new Date(start);
+  const e = (end instanceof Date) ? end : new Date(end);
+  sh.appendRow([now, type, mgmtRow, eventId || "", title, s, e, desc || "", 0, nextAt, lastError || "", "待機"]);
+}
+
+function parseDateCell_(v) {
+  if (!v) return null;
+  if (v instanceof Date) return v;
+  if (typeof v === "number" && isFinite(v)) { const d = new Date(v); return isNaN(d.getTime()) ? null : d; }
+  if (typeof v === "string") { const d = new Date(v); return isNaN(d.getTime()) ? null : d; }
+  return null;
+}
+
+function processRetryQueue() {
+  ensureAll_();
+  const ss = ssLog_();
+  const sh = ss.getSheetByName(CONFIG.QUEUE_SHEET);
+  const lastRow = sh.getLastRow();
+  if (lastRow < 2) return;
+  const rows = sh.getRange(2, 1, lastRow - 1, sh.getLastColumn()).getValues();
+  const now = new Date().getTime();
+
+  for (let i = 0; i < rows.length; i++) {
+    const r = i + 2;
+    const status = String(rows[i][11] || "");
+    if (status === "完了" || status === "中止") continue;
+    const tries = Number(rows[i][8] || 0);
+    if (tries >= CONFIG.RETRY_MAX_TRIES) { sh.getRange(r, 12).setValue("中止"); continue; }
+    const nextAt = rows[i][9] instanceof Date ? rows[i][9].getTime() : new Date(rows[i][9]).getTime();
+    if (isNaN(nextAt) || nextAt > now) continue;
+    const type = String(rows[i][1] || "");
+    const mgmtRow = Number(rows[i][2] || 0);
+    const eventId = String(rows[i][3] || "");
+    const title = String(rows[i][4] || "");
+    const start = parseDateCell_(rows[i][5]);
+    const end = parseDateCell_(rows[i][6]);
+    const desc = String(rows[i][7] || "");
+
+    try {
+      if (type === "calendar_upsert") {
+        if (!start || !end || isNaN(start.getTime()) || isNaN(end.getTime())) throw new Error("retry time invalid");
+        const id = upsertEvent_(eventId || "", title, start, end, desc);
+        Utilities.sleep(3000);
+        if (mgmtRow) {
+          const currentMgmt = readMgmtByRow_(mgmtRow);
+          let currentIds = currentMgmt.EventId ? currentMgmt.EventId.split(",").filter(Boolean) : [];
+          if (!currentIds.includes(id)) currentIds.push(id);
+          updateMgmt_(mgmtRow, { EventId: currentIds.join(",") });
+        }
+      }
+      sh.getRange(r, 9).setValue(tries + 1);
+      sh.getRange(r, 11).setValue("");
+      sh.getRange(r, 12).setValue("完了");
+      notifyAdminSuccessOnce_("【スマートEX】再試行キュー 成功", `${title}\n\n${makeQueueLink_()}`);
+    } catch (e) {
+      const n = tries + 1;
+      const backoffMin = Math.min(60, Math.pow(2, n));
+      const next = new Date(Date.now() + backoffMin * 60 * 1000);
+      sh.getRange(r, 9).setValue(n);
+      sh.getRange(r, 10).setValue(next);
+      sh.getRange(r, 11).setValue(String(e && e.stack ? e.stack : e));
+      sh.getRange(r, 12).setValue("待機");
+    }
+  }
+}
+
+function ensureDashboardSheet_() {
+  const ss = ssLog_();
+  if (!ss.getSheetByName(CONFIG.DASHBOARD_SHEET)) {
+    const sh = ss.insertSheet(CONFIG.DASHBOARD_SHEET);
+    sh.getRange(1, 1, 1, 6).setValues([["更新日時", "総件数", "新規", "変更あり", "処理済", "要確認"]]);
+    sh.getRange(3, 1, 1, 6).setValues([["状態", "お預かり番号", "MainSheet", "MainRow", "利用者", "リンク"]]);
+  }
+}
+
+function updateDashboard() {
+  ensureAll_();
+  const ss = ssLog_();
+  const dash = ss.getSheetByName(CONFIG.DASHBOARD_SHEET);
+  const mg = ss.getSheetByName(CONFIG.MGMT_SHEET);
+  const lastRow = mg.getLastRow();
+  const total = Math.max(0, lastRow - 1);
+  let cNew = 0, cChg = 0, cDone = 0;
+  const cStatus = mgCol_("状態");
+  const statuses = total > 0 ? mg.getRange(2, cStatus, total, 1).getValues().flat().map(v => String(v || "")) : [];
+  for (const s of statuses) {
+    if (s === "新規") cNew++;
+    else if (s === "変更あり") cChg++;
+    else if (s === "処理済") cDone++;
+  }
+  dash.getRange(2, 1, 1, 6).setValues([[new Date(), total, cNew, cChg, cDone, 0]]);
+  const outStart = 4;
+  const outMax = Math.max(0, dash.getMaxRows() - outStart + 1);
+  if (outMax > 0) dash.getRange(outStart, 1, outMax, 6).clearContent();
+  if (total <= 0) return;
+  const cNo = mgCol_("お預かり番号");
+  const cMainSheet = mgCol_("MainSheet");
+  const cMainRow = mgCol_("MainRow");
+  const nos = mg.getRange(2, cNo, total, 1).getValues().flat().map(v => String(v || ""));
+  const msheets = mg.getRange(2, cMainSheet, total, 1).getValues().flat().map(v => String(v || ""));
+  const mrows = mg.getRange(2, cMainRow, total, 1).getValues().flat();
+  const lines = [];
+  for (let i = 0; i < total; i++) {
+    const st = statuses[i];
+    if (st === "処理済") continue;
+    const sheetName = msheets[i];
+    const targetRow = mrows[i];
+    const user = tryReadMainTarget_(sheetName, targetRow);
+    const link = makeMainSheetRowLink_(sheetName, targetRow);
+    lines.push([st, nos[i], sheetName, targetRow, user, link ? `=HYPERLINK("${link}","開く")` : ""]);
+  }
+  if (lines.length) dash.getRange(outStart, 1, lines.length, 6).setValues(lines);
+}
+
+function tryReadMainTarget_(sheetName, row) {
+  try {
+    const ss = ssMain_();
+    const sh = ss.getSheetByName(sheetName);
+    if (!sh) return "";
+    if (!row || row < CONFIG.MAIN_DATA_START_ROW) return "";
+    return String(sh.getRange(Number(row), COL_MAIN.TARGET).getValue() || "");
+  } catch (_) { return ""; }
+}
+
+function ensureOverrideSheet_() {
+  const ss = ssLog_();
+  if (!ss.getSheetByName(CONFIG.OVERRIDE_SHEET)) {
+    const sh = ss.insertSheet(CONFIG.OVERRIDE_SHEET);
+    sh.appendRow(["日時", "種別", "GmailMsgId", "予約キー", "お預かり番号"]);
+  }
+}
+
+function appendOverrideHistory_(type, msgId, key, reserveNo) {
+  const ss = ssLog_();
+  const sh = ss.getSheetByName(CONFIG.OVERRIDE_SHEET);
+  if (sh) sh.appendRow([new Date(), type, msgId, key, reserveNo || ""]);
+}
+
+function overridePropKey_(msgId) { return CONFIG.OVERRIDE_PREFIX + String(msgId); }
+
+function icPropKey_(reserveNo) { return "SMX_IC_" + String(reserveNo || "").trim(); }
+
+function putIcCards_(reserveNo, cards, at) {
+  const k = icPropKey_(reserveNo);
+  if (!k || k.endsWith("_")) return;
+  const payload = { at: at instanceof Date ? at.toISOString() : new Date().toISOString(), cards: Array.from(new Set((cards || []).map(x => normalizeCardKey_(x)).filter(Boolean))) };
+  PropertiesService.getScriptProperties().setProperty(k, JSON.stringify(payload));
+}
+
+function getIcCards_(reserveNo) {
+  const k = icPropKey_(reserveNo);
+  const s = PropertiesService.getScriptProperties().getProperty(k);
+  if (!s) return null;
+  try { return JSON.parse(s); } catch (_) { return null; }
+}
+
+function getOverrideKeyForMsgId_(msgId) {
+  return PropertiesService.getScriptProperties().getProperty(overridePropKey_(msgId)) || "";
+}
+
+function clearOverride_(msgId) {
+  PropertiesService.getScriptProperties().deleteProperty(overridePropKey_(msgId));
+}
+
+function ensureAuditSheets_() {
+  const ss = ssLog_();
+  if (!ss.getSheetByName(CONFIG.AUDIT_SHEET)) ss.insertSheet(CONFIG.AUDIT_SHEET).appendRow(["日時", "種別", "お預かり番号", "シート", "行", "結果", "メッセージ"]);
+  if (!ss.getSheetByName(CONFIG.PARSER_SHEET)) ss.insertSheet(CONFIG.PARSER_SHEET).appendRow(["日時", "不足項目/理由", "お預かり番号", "本文抜粋"]);
+  if (!ss.getSheetByName(CONFIG.CHANGELOG_SHEET)) ss.insertSheet(CONFIG.CHANGELOG_SHEET).appendRow(["日時", "お預かり番号", "差引円", "GmailMsgId"]);
+  if (!ss.getSheetByName(CONFIG.FREE_SEAT_SHEET)) ss.insertSheet(CONFIG.FREE_SEAT_SHEET).appendRow(["記録日時", "GmailMsgId", "ThreadId", "受信日時", "件名", "お預かり番号", "乗車日", "発", "着", "URL", "本文抜粋"]);
+}
+
+function audit_(t, no, s, r, res, msg) {
+  const ss = ssLog_();
+  const sh = ss.getSheetByName(CONFIG.AUDIT_SHEET);
+  if (sh) sh.appendRow([new Date(), t, no, s, r, res, msg]);
+}
+
+function logParserAnomaly_(m, no, s) {
+  const ss = ssLog_();
+  const sh = ss.getSheetByName(CONFIG.PARSER_SHEET);
+  if (sh) sh.appendRow([new Date(), m, no, s]);
+}
+
+function isBreakerOpen_() {
+  return PropertiesService.getScriptProperties().getProperty("BREAKER_OPEN") === "1";
+}
+
+function incParserFail_(msgId, opt) {
+  const o = opt || {};
+  const reason = String(o.reason || "");
+  if (o.ignoreBreaker) {
+    try {
+      const p = PropertiesService.getScriptProperties();
+      const k = "FAIL_KNOWN_" + (reason || "UNKNOWN");
+      const n = Number(p.getProperty(k) || 0) + 1;
+      p.setProperty(k, String(n));
+    } catch (_) { }
+    return;
+  }
+  const p = PropertiesService.getScriptProperties();
+  const n = Number(p.getProperty("FAIL") || 0) + 1;
+  p.setProperty("FAIL", String(n));
+  if (n >= CONFIG.BREAKER_FAIL_LIMIT) {
+    p.setProperty("BREAKER_OPEN", "1");
+    notifyAdminError_("【スマートEX】パーサ異常多発のため自動停止", makeCandidateLink_(), String(msgId || ""));
+  }
+}
+
+function resetParserFail_() {
+  const p = PropertiesService.getScriptProperties();
+  p.setProperty("FAIL", "0");
+  try {
+    const all = p.getProperties();
+    for (const k in all) { if (/^FAIL_KNOWN_/.test(k)) p.deleteProperty(k); }
+  } catch (_) { }
+}
+
+function notifySoumuAuto_(d) {
+  if (!CONFIG.SOUMU_MAIL) return;
+  if (!CONFIG.NOTIFY_SOUMU_IMPORT_OK) return;
+  const body = (d.rawBlock || "").slice(0, 8000);
+  sendLabeledEmail_(CONFIG.SOUMU_MAIL, "【スマートEX】取込完了（確認用）", body, CONFIG.LABEL_NOTIFY_SOUMU);
+}
+
+function notifySoumuMissingCard_(d, missing, originalBody, msgId) {
+  if (!CONFIG.SOUMU_MAIL) return;
+  if (!CONFIG.NOTIFY_SOUMU_MISSING_CARD) return;
+  if (shouldSuppressNotify_("SOUMU_MISSING", String(msgId || ""), 3600)) return;
+  const txt = "未登録ICカードが含まれるため隔離しました。\n\nお預かり番号: " + (d.reserveNo || "") + "\n乗車日: " + (d.rideDateStr || "") + "\n区間: " + (d.from || "") + "→" + (d.to || "") + "\n未登録カード: " + (missing || []).join(",") + "\n\n社員情報シートへ ICカード番号 を登録後、メニュー「要確認ラベルを再処理」を実行してください。\n\n本文抜粋:\n" + String(originalBody || "").slice(0, 4000);
+  sendLabeledEmail_(CONFIG.SOUMU_MAIL, "【要対応】スマートEX 未登録ICカード", txt, CONFIG.LABEL_NOTIFY_SOUMU);
+}
+
+function notifyAdminError_(message, link, msgId) {
+  if (!CONFIG.ADMIN_MAIL) return;
+  const body = link ? (String(message) + "\n\n" + link) : String(message);
+  const ttl = Number(CONFIG.NOTIFY_TTL_SECONDS || 7200);
+  const key = msgId ? ("MSGID:" + String(msgId)) : ("BODY:" + sha256Base64_(body).slice(0, 64));
+  if (shouldSuppressNotify_("ADMIN_ERR", key, ttl)) return;
+  sendLabeledEmail_(CONFIG.ADMIN_MAIL, "【スマートEX】エラー/要確認", body, CONFIG.LABEL_NOTIFY_ADMIN);
+}
+
+function notifyAdminGas_(subject, body, key) {
+  if (!CONFIG.ADMIN_MAIL) return;
+  const s = String(subject || "");
+  const subj = s.startsWith("【GAS通知】") ? s : ("【GAS通知】" + s);
+  const ttl = Number(CONFIG.NOTIFY_TTL_SECONDS || 7200);
+  const k = String(key || sha256Base64_(subj + "|" + String(body || "")).slice(0, 64));
+  if (shouldSuppressNotify_("ADMIN_GAS", k, ttl)) return;
+  sendLabeledEmail_(CONFIG.ADMIN_MAIL, subj, String(body || ""), CONFIG.LABEL_NOTIFY_ADMIN);
+}
+
+function notifyAdminError(message, link, msgId) { return notifyAdminError_(message, link, msgId); }
+
+function notifyAdminSuccessOnce_(subject, body) {
+  if (!CONFIG.ADMIN_MAIL || !CONFIG.NOTIFY_SUCCESS) return;
+  const ttl = Number(CONFIG.SUCCESS_NOTIFY_TTL_SECONDS || 3600);
+  const key = "S:" + sha256Base64_(String(subject) + "|" + String(body)).slice(0, 64);
+  if (shouldSuppressNotify_("ADMIN_OK", key, ttl)) return;
+  sendLabeledEmail_(CONFIG.ADMIN_MAIL, subject, body, CONFIG.LABEL_NOTIFY_ADMIN);
+}
+
+function sendLabeledEmail_(to, subject, body, labelName) {
+  safeNotify_(() => GmailApp.sendEmail(String(to), String(subject), String(body || "")));
+  if (!labelName) return;
+  safeNotify_(() => {
+    const q = 'in:sent newer_than:7d subject:("' + escapeGmailQuery_(subject) + '")';
+    const threads = GmailApp.search(q, 0, 1);
+    if (threads && threads.length) addLabel_(threads[0], labelName);
+  });
+}
+
+function escapeGmailQuery_(s) {
+  return String(s || "").replace(/["\\]/g, "\\$&");
+}
+
+function addLabel_(thread, name) {
+  try {
+    let l = GmailApp.getUserLabelByName(name);
+    if (!l) {
+      try { l = GmailApp.createLabel(name); } catch (e) { console.warn("Label create failed: " + name); return; }
+    }
+    thread.addLabel(l);
+  } catch (e) { console.warn("addLabel_ failed for " + name + ": " + e); }
+}
+
+function removeLabel_(thread, name) {
+  try {
+    const l = GmailApp.getUserLabelByName(name);
+    if (l) { thread.removeLabel(l); }
+  } catch (e) { console.warn("removeLabel_ failed for " + name + ": " + e); }
+}
+
+function threadHasLabel_(thread, name) {
+  try {
+    const l = GmailApp.getUserLabelByName(name);
+    if (!l) return false;
+    const labels = thread.getLabels();
+    if (!labels || labels.length === 0) return false;
+    for (const label of labels) {
+      try { if (label.getName() === name) return true; } catch (_) { continue; }
+    }
+    return false;
+  } catch (e) { console.warn("threadHasLabel_ check failed: " + e); return false; }
+}
+
+function pickStr_(text, re) {
+  const m = String(text || "").match(re);
+  return (m && m[1]) ? String(m[1]).trim() : "";
+}
+
+function pickNumber_(text, re) {
+  const s = pickStr_(text, re);
+  if (!s) return "";
+  return Number(s.replace(/,/g, ""));
+}
+
+function parseHM_(v) {
+  if (v instanceof Date) {
+    const h = v.getHours();
+    const m = v.getMinutes();
+    if (Number.isFinite(h) && Number.isFinite(m)) return { h, m };
+    return null;
+  }
+  if (typeof v === "string") {
+    let s = v.replace(/\u00A0/g, " ").replace(/\u3000/g, " ").trim();
+    s = toHalfWidth_(s);
+    s = s.replace(/：/g, ":").trim();
+    const mJ = s.match(/(\d{1,2})\s時\s(\d{1,2})\s*分?/);
+    if (mJ) {
+      const h = Number(mJ[1]);
+      const mm = Number(mJ[2]);
+      if (Number.isFinite(h) && Number.isFinite(mm) && h >= 0 && h <= 23 && mm >= 0 && mm <= 59) return { h, m: mm };
+    }
+    const mAny = s.match(/(\d{1,2}):(\d{2})/);
+    if (mAny) {
+      const h = Number(mAny[1]);
+      const mm = Number(mAny[2]);
+      if (Number.isFinite(h) && Number.isFinite(mm) && h >= 0 && h <= 23 && mm >= 0 && mm <= 59) return { h, m: mm };
+    }
+    return null;
+  }
+  if (typeof v === "number" && Number.isFinite(v)) {
+    const frac = v - Math.floor(v);
+    const totalMin = Math.round(frac * 24 * 60);
+    const mins = ((totalMin % 1440) + 1440) % 1440;
+    const h = Math.floor(mins / 60);
+    const m = mins % 60;
+    if (h >= 0 && h <= 23 && m >= 0 && m <= 59) return { h, m };
+    return null;
+  }
+  return null;
+}
+
+function normalizeHM_(v) {
+  const t = parseHM_(v);
+  if (!t) return "";
+  return String(t.h).padStart(2, "0") + ":" + String(t.m).padStart(2, "0");
+}
+
+function normalizeDateStr_(v) {
+  if (!v) return "";
+  if (v instanceof Date) return Utilities.formatDate(v, Session.getScriptTimeZone(), "yyyy-MM-dd");
+  if (typeof v === "string") {
+    const s = v.trim();
+    const m = s.match(/^(\d{4})-?(\d{2})-?(\d{2})/);
+    if (m) return String(m[1]) + "-" + String(m[2]).padStart(2, "0") + "-" + String(m[3]).padStart(2, "0");
+    return "";
+  }
+  return "";
+}
+
+function formatIso_(d) {
+  const x = d instanceof Date ? d : new Date(d);
+  return Utilities.formatDate(x, Session.getScriptTimeZone(), "yyyy-MM-dd'T'HH:mm:ss");
+}
+
+function readMainRowSummary_(mgmt) {
+  const sheetName = String(mgmt.MainSheet || "").trim();
+  const row = Number(mgmt.MainRow || 0);
+  if (!sheetName || !row) return null;
+  try {
+    const ss = ssMain_();
+    const sh = ss.getSheetByName(sheetName);
+    if (!sh) return null;
+    ensureMainKeyColumn_(sh);
+    const date = sh.getRange(row, COL_MAIN.DATE).getValue();
+    const amount = sh.getRange(row, COL_MAIN.AMOUNT).getValue();
+    const target = String(sh.getRange(row, COL_MAIN.TARGET).getValue() || "");
+    const url = String(sh.getRange(row, COL_MAIN.URL).getValue() || "");
+    const remarks = String(sh.getRange(row, COL_MAIN.REMARKS).getValue() || "");
+    const key = String(sh.getRange(row, COL_MAIN.KEY).getValue() || "");
+    const d = (date instanceof Date) ? Utilities.formatDate(date, Session.getScriptTimeZone(), "yyyy-MM-dd") : String(date || "");
+    const a = (typeof amount === "number") ? String(amount) : String(amount || "");
+    return { sheetName, row, d, a, target, url, remarks, key };
+  } catch (_) { return null; }
+}
+
+function makeMainSheetRowLink_(sheetName, row) {
+  try {
+    const ss = ssMain_();
+    const sh = ss.getSheetByName(sheetName);
+    if (!sh || !row) return "";
+    return ss.getUrl() + "#gid=" + sh.getSheetId() + "&range=A" + row;
+  } catch (_) { return ""; }
+}
+
+function makeCandidateLink_() {
+  try { return ssLog_().getUrl(); } catch (_) { return ""; }
+}
+
+function makeQueueLink_() {
+  try {
+    const ss = ssLog_();
+    const sh = ss.getSheetByName(CONFIG.QUEUE_SHEET);
+    if (!sh) return ss.getUrl();
+    return ss.getUrl() + "#gid=" + sh.getSheetId();
+  } catch (_) { return ""; }
+}
+
+function inferRideDate_(m) {
+  if (m && m.RideDate instanceof Date && !isNaN(m.RideDate.getTime())) return m.RideDate;
+  const s = String(m && m.RideDate !== undefined ? m.RideDate : "").trim();
+  if (s) {
+    const mm = s.match(/(\d{4})\/(\d{2})\/(\d{2})/);
+    if (mm) {
+      const y = Number(mm[1]), mo = Number(mm[2]), d = Number(mm[3]);
+      const dt = new Date(y, mo - 1, d, 0, 0, 0, 0);
+      if (!isNaN(dt.getTime())) return dt;
+    }
+    const dt2 = new Date(s);
+    if (!isNaN(dt2.getTime())) return dt2;
+  }
+  return new Date();
+}
+
+function rebuildDataFromMgmt_(m, resolved, company, rideDate) {
+  const rd = rideDate instanceof Date ? rideDate : new Date(rideDate);
+  return {
+    reserveNo: m.ReserveNo, rideDate: rd, rideDateStr: Utilities.formatDate(rd, Session.getScriptTimeZone(), "yyyy-MM-dd"),
+    from: String(m.From || ""), to: String(m.To || ""), depTime: m.Dep, arrTime: m.Arr, train: "",
+    amount: tryReadMainAmount_(m.MainSheet, m.MainRow), rawBlock: m.Block || "",
+    cards: String(m.Cards || "").split(",").map(x => x.trim()).filter(x => x),
+    cardsMasked: maskCards_(String(m.Cards || "").split(",").map(x => x.trim()).filter(x => x)),
+    names: resolved.names || [], bases: resolved.bases || [],
+    primaryName: (resolved.names && resolved.names.length ? resolved.names[0] : ""),
+    company: company || ""
+  };
+}
+
+function tryReadMainAmount_(sheetName, row) {
+  try {
+    const ss = ssMain_();
+    const sh = ss.getSheetByName(sheetName);
+    if (!sh || !row) return "";
+    const v = sh.getRange(Number(row), COL_MAIN.AMOUNT).getValue();
+    if (typeof v === "number") return v;
+    const s = String(v || "").replace(/[^\d]/g, "");
+    return s ? Number(s) : "";
+  } catch (_) { return ""; }
+}
+
+function onEdit(e) {
+  try {
+    if (!e || !e.range) return;
+    if (e.range.getNumRows() !== 1 || e.range.getNumColumns() !== 1) return;
+    const lock = LockService.getScriptLock();
+    if (!lock.tryLock(10000)) return;
+    try {
+      const norm_ = (v) => String(v || "").replace(/\u00A0/g, " ").replace(/\u3000/g, " ").replace(/\s+/g, " ").trim();
+      const sh = e.range.getSheet();
+      const sheetName = norm_(sh.getName());
+      if (sheetName === norm_(CONFIG.MGMT_SHEET)) return;
+      const isFiscal = /^新幹線\s\d{4}\/\d{2}-/.test(sheetName);
+      const isMain = /^\d{4}\/\d{2}-$/.test(sheetName);
+      if (!isFiscal && !isMain) return;
+      const userCol = isFiscal ? COL_FISCAL.USER : COL_MAIN.TARGET;
+      if (e.range.getColumn() !== userCol) return;
+      const dataStartRow = isFiscal ? CONFIG.FISCAL_DATA_START_ROW : CONFIG.MAIN_DATA_START_ROW;
+      const row = e.range.getRow();
+      if (row < dataStartRow) return;
+      const newUser = norm_(e.value);
+      if (!newUser) return;
+      const keyCol = isFiscal ? COL_FISCAL.KEY : COL_MAIN.KEY;
+      const key = norm_(sh.getRange(row, keyCol).getValue());
+      if (!key) return;
+      const mgmt = getMgmtByKey_(key);
+      if (!mgmt) return;
+      const lastUser = norm_(mgmt.Lastuser);
+      if (lastUser && lastUser === newUser) return;
+      const oldUser = norm_(e.oldValue);
+      if (!lastUser && oldUser && oldUser === newUser) return;
+      const ride = inferRideDate_(mgmt);
+      if (!(ride instanceof Date) || isNaN(ride.getTime())) return;
+      const from = norm_(mgmt.From);
+      const to = norm_(mgmt.To);
+      if (!from || !to) return;
+      const dep = normalizeHM_(mgmt.Dep || "");
+      const arr = normalizeHM_(mgmt.Arr || "");
+      if (!dep || !arr) return;
+      
+      const newNames = newUser.split(/[\s　]+/).filter(Boolean);
+      const d = { from: from, to: to, names: newNames, rawBlock: mgmt.Block || "", rideDate: ride, depTime: dep, arrTime: arr };
+      const evIds = syncCalendarEvents_(mgmt.row, mgmt.EventId || "", d);
+      
+      if (evIds) updateMgmt_(mgmt.row, { EventId: evIds, Status: "処理済", Lastuser: newUser });
+    } finally {
+      lock.releaseLock();
+    }
+  } catch (err) {
+    console.error(err && err.stack ? err.stack : err);
+  }
+}
+
+function safeNotify_(fn) {
+  try { return fn(); } catch (e) { Logger.log("notify failed: " + String(e && e.stack ? e.stack : e)); return null; }
+}
+
+function existsMsgId_(msgId) { return isMsgDone_(msgId); }
+
+function createSheetStrict_(ss, name) {
+  const n = String(name || "").trim();
+  if (!n) throw new Error("Sheet name empty");
+  const exist = ss.getSheetByName(n);
+  if (exist) return exist;
+  return ss.insertSheet(n);
+}
+
+function createSheetThenNameOrRollback_(ss, name) {
+  const n = String(name || "").trim();
+  if (!n) throw new Error("Sheet name empty");
+  const exist = ss.getSheetByName(n);
+  if (exist) return exist;
+  const sh = ss.insertSheet();
+  try { sh.setName(n); return sh; } catch (e) { try { ss.deleteSheet(sh); } catch (_) {} throw e; }
+}
+
+function safeGetThreadPermalink_(thread) {
+  try { if (thread && typeof thread.getPermalink === "function") return thread.getPermalink(); } catch (_) { }
+  return "";
+}
+
+function safeSetValue_(range, value, opt) {
+  const o = opt || {};
+  const blankIfInvalid = !!o.blankIfInvalid;
+  try {
+    const dv = range.getDataValidation();
+    if (dv && blankIfInvalid) {
+      if (value === "" || value === null || value === undefined) { range.setValue(""); return; }
+      if (!isValueAllowedByValidation_(dv, value)) { range.setValue(""); return; }
+    }
+    range.setValue(value);
+  } catch (e) {
+    if (blankIfInvalid) { try { range.setValue(""); } catch (_) { } return; }
+    throw e;
+  }
+}
+
+function isValueAllowedByValidation_(dv, value) {
+  try {
+    const t = dv.getCriteriaType();
+    const a = dv.getCriteriaValues();
+    const v = String(value);
+    if (t === SpreadsheetApp.DataValidationCriteria.VALUE_IN_LIST) {
+      const list = (a && a[0]) ? a[0].map(x => String(x)) : [];
+      return list.includes(v);
+    }
+    if (t === SpreadsheetApp.DataValidationCriteria.VALUE_IN_RANGE) {
+      const rng = a && a[0] ? a[0] : null;
+      if (!rng) return true;
+      const vals = rng.getValues().flat().map(x => String(x));
+      return vals.includes(v);
+    }
+    return true;
+  } catch (_) { return true; }
+}
+
+function sha256Base64_(s) {
+  const bytes = Utilities.computeDigest(Utilities.DigestAlgorithm.SHA_256, String(s || ""), Utilities.Charset.UTF_8);
+  return Utilities.base64EncodeWebSafe(bytes);
+}
+
+function shouldSuppressNotify_(type, key, ttlSec) {
+  const ttl = Number(ttlSec || CONFIG.NOTIFY_TTL_SECONDS || 7200);
+  const now = Date.now();
+  const hash = sha256Base64_(String(type) + "|" + String(key)).slice(0, 48);
+  const cacheKey = "SMX_N_" + hash;
+  const propKey = "SMX_N_" + hash;
+  try {
+    const cache = CacheService.getScriptCache();
+    if (cache.get(cacheKey)) return true;
+    cache.put(cacheKey, "1", Math.min(21600, ttl));
+  } catch (_) { }
+  const props = PropertiesService.getScriptProperties();
+  const until = Number(props.getProperty(propKey) || 0);
+  if (until && now < until) return true;
+  props.setProperty(propKey, String(now + ttl * 1000));
+  return false;
+}
+
+function resyncAndReportFixNeeded() {
+  const lock = LockService.getScriptLock();
+  if (!lock.tryLock(30000)) throw new Error("ロック取得に失敗しました（他処理実行中）");
+  try {
+    ensureAll_();
+    resyncMgmtPointers_();
+    const ssMain = ssMain_();
+    const ssLog = ssLog_();
+    const reportName = "スマートEX_要修正_" + Utilities.formatDate(new Date(), Session.getScriptTimeZone(), "yyyyMMdd_HHmmss");
+    const rep = ssLog.insertSheet(reportName);
+    rep.getRange(1, 1, 1, 19).setValues([["判定", "MGMT行", "予約キー", "お預かり番号", "状態", "MainSheet", "MainRow", "Mainの予約キー", "Main日付", "Main金額", "Main手配・購入先", "Main小項目", "Main会社名", "Main備考", "期待金額(本文)", "差分メモ", "GmailThreadId", "ThreadLink", "MainURL(参考)"]]);
+    rep.setFrozenRows(1);
+    const mg = ssLog.getSheetByName(CONFIG.MGMT_SHEET);
+    const lastRow = mg.getLastRow();
+    if (lastRow < 2) return;
+    primeMgmtColCache_();
+    const cNo = mgCol_("お預かり番号");
+    const cStatus = mgCol_("状態");
+    const cMainSheet = mgCol_("MainSheet");
+    const cMainRow = mgCol_("MainRow");
+    const cKey = mgCol_("予約キー");
+    const cBlock = mgCol_("予約本文ブロック");
+    const cThreadId = mgCol_("ThreadId");
+    const cThreadLink = mgCol_("ThreadLink");
+    const mgVals = mg.getRange(2, 1, lastRow - 1, mg.getLastColumn()).getValues();
+    const out = [];
+    for (let i = 0; i < mgVals.length; i++) {
+      const r = i + 2;
+      const row = mgVals[i];
+      const reserveNo = String(row[cNo - 1] || "").trim();
+      const status = String(row[cStatus - 1] || "").trim();
+      const mainSheetName = String(row[cMainSheet - 1] || "").trim();
+      const mainRowNum = Number(row[cMainRow - 1] || 0);
+      const key = String(row[cKey - 1] || "").trim();
+      const block = String(row[cBlock - 1] || "");
+      const threadId = String(row[cThreadId - 1] || "").trim();
+      const threadLink = String(row[cThreadLink - 1] || "").trim();
+      if (!key || !key.startsWith("SMX|") || status === "重複(無効)") continue;
+      const expAmount = amountFromBlockForAudit_(block);
+      if (!mainSheetName || !mainRowNum) {
+        out.push(buildFixRowSlim_("POINTER_MISSING", r, key, reserveNo, status, mainSheetName, mainRowNum, "", "", "", "", "", "", "", expAmount, "Main参照なし", threadId, threadLink, ""));
+        continue;
+      }
+      const mainSh = ssMain.getSheetByName(mainSheetName);
+      if (!mainSh) {
+        out.push(buildFixRowSlim_("MAIN_SHEET_MISSING", r, key, reserveNo, status, mainSheetName, mainRowNum, "", "", "", "", "", "", "", expAmount, "MainSheetが存在しない", threadId, threadLink, ""));
+        continue;
+      }
+      ensureMainKeyColumn_(mainSh);
+      const lr = mainSh.getLastRow();
+      if (mainRowNum < CONFIG.MAIN_DATA_START_ROW || mainRowNum > lr) {
+        out.push(buildFixRowSlim_("MAIN_ROW_OUT", r, key, reserveNo, status, mainSheetName, mainRowNum, "", "", "", "", "", "", "", expAmount, "MainRowが範囲外", threadId, threadLink, ""));
+        continue;
+      }
+      const mainKey = String(mainSh.getRange(mainRowNum, COL_MAIN.KEY).getValue() || "").trim();
+      const mainDate = mainSh.getRange(mainRowNum, COL_MAIN.DATE).getValue();
+      const mainAmount = mainSh.getRange(mainRowNum, COL_MAIN.AMOUNT).getValue();
+      const mainVendor = String(mainSh.getRange(mainRowNum, COL_MAIN.VENDOR).getValue() || "").trim();
+      const mainItem = String(mainSh.getRange(mainRowNum, COL_MAIN.ITEM).getValue() || "").trim();
+      const mainCompany = String(mainSh.getRange(mainRowNum, COL_MAIN.COMPANY).getValue() || "").trim();
+      const mainRemarks = String(mainSh.getRange(mainRowNum, COL_MAIN.REMARKS).getValue() || "");
+      const mainUrl = String(mainSh.getRange(mainRowNum, COL_MAIN.URL).getValue() || "").trim();
+      if (!(mainVendor === "スマートEX" && mainItem === "新幹線")) continue;
+      const diffs = [];
+      if (mainKey !== key) diffs.push("予約キー不一致");
+      const mainAmtNorm = normalizeAmount_(mainAmount);
+      if (expAmount !== "" && mainAmtNorm !== "" && String(expAmount) !== String(mainAmtNorm)) diffs.push("金額不一致");
+      if (!diffs.length) continue;
+      out.push(buildFixRowSlim_("MISMATCH", r, key, reserveNo, status, mainSheetName, mainRowNum, mainKey, formatCellDate_(mainDate), mainAmtNorm, mainVendor, mainItem, mainCompany, mainRemarks, expAmount, diffs.join(" / "), threadId, threadLink, mainUrl));
+    }
+    if (out.length) rep.getRange(2, 1, out.length, out[0].length).setValues(out);
+  } finally { lock.releaseLock(); }
+}
+
+function buildFixRowSlim_(judge, mgmtRow, key, reserveNo, status, mainSheet, mainRow, mainKey, mainDate, mainAmount, mainVendor, mainItem, mainCompany, mainRemarks, expAmount, diffMemo, threadId, threadLink, mainUrl) {
+  return [String(judge || ""), Number(mgmtRow || 0), String(key || ""), String(reserveNo || ""), String(status || ""), String(mainSheet || ""), Number(mainRow || 0), String(mainKey || ""), String(mainDate || ""), mainAmount === "" ? "" : mainAmount, String(mainVendor || ""), String(mainItem || ""), String(mainCompany || ""), String(mainRemarks || ""), expAmount === "" ? "" : expAmount, String(diffMemo || ""), String(threadId || ""), String(threadLink || ""), String(mainUrl || "")];
+}
+
+function amountFromBlockForAudit_(blockText) {
+  const v = pickNumber_(String(blockText || ""), /発売額\s*([\d,]+)円/);
+  return v === "" ? "" : v;
+}
+
+function normalizeAmount_(v) {
+  if (v === "" || v === null || v === undefined) return "";
+  if (typeof v === "number" && isFinite(v)) return String(v);
+  const s = String(v || "").replace(/[^\d]/g, "");
+  return s ? String(Number(s)) : "";
+}
+
+function formatCellDate_(v) {
+  if (!v) return "";
+  if (v instanceof Date) return Utilities.formatDate(v, Session.getScriptTimeZone(), "yyyy-MM-dd");
+  return String(v || "");
+}
+
+function buildCalendarResyncPendingBody_(mgmt, title) {
+  const reserveNo = String(mgmt.ReserveNo || "");
+  const key = String(mgmt.Key || "");
+  const mainSheet = String(mgmt.MainSheet || "");
+  const mainRow = String(mgmt.MainRow || "");
+  const eventId = String(mgmt.EventId || "");
+  const threadLink = String(mgmt.ThreadLink || "");
+  return ("カレンダー再同期が保留になりました。\n\n" + "管理行: " + String(mgmt.row || "") + "\n" +
+  "予約キー: " + key + "\n" + "お預かり番号: " + reserveNo + "\n" + "Main: " + mainSheet + " 行 " + mainRow + "\n" +
+  "EventId: " + (eventId ? eventId : "（なし）") + "\n" + "ThreadLink: " + threadLink + "\n" + "タイトル: " + title + "\n\n" +
+  "対応: 再試行キュー処理（processRetryQueue）を実行するか、権限/カレンダーIDを確認してください。");
+}
+
+function resyncCalendarByKeyPrompt() {
+  ensureAll_();
+  const ui = SpreadsheetApp.getUi();
+  const p = ui.prompt("カレンダー再同期（予約キー指定）", "予約キーを貼り付けてください（例：SMX|...#...）", ui.ButtonSet.OK_CANCEL);
+  if (p.getSelectedButton() !== ui.Button.OK) return;
+  const key = String(p.getResponseText() || "").trim();
+  if (!key) throw new Error("予約キーが空です");
+  resyncCalendarByKey_(key);
+}
+
+function safeAlert_(title, message) {
+  try { SpreadsheetApp.getUi().alert(String(title || ""), String(message || ""), SpreadsheetApp.getUi().ButtonSet.OK); }
+  catch (e) { Logger.log("%s: %s", String(title || "INFO"), String(message || "")); }
+}
+
+function resyncCalendarByKey_(key) {
+  const lock = LockService.getScriptLock();
+  if (!lock.tryLock(30000)) throw new Error("ロック取得に失敗しました（他処理実行中）");
+  try {
+    const mgmt = getMgmtByKey_(String(key || "").trim());
+    if (!mgmt) throw new Error("管理シートで予約キーが見つかりません: " + String(key || ""));
+    const ride = inferRideDate_(mgmt);
+    const depRaw = mgmt.Dep || mgmt.DepTime || mgmt.Departure || mgmt.DepartureTime || mgmt.出発時刻 || mgmt.出発 || "";
+    const arrRaw = mgmt.Arr || mgmt.ArrTime || mgmt.Arrival || mgmt.ArrivalTime || mgmt.到着時刻 || mgmt.到着 || "";
+    const dep = normalizeHM_(depRaw);
+    const arr = normalizeHM_(arrRaw);
+    
+    const cardsStr = String(mgmt.Cards || "").trim();
+    let names = (cardsStr ? resolveCards_(cardsStr.split(",").map(x => x.trim()).filter(x => x)).names : []) || [];
+    
+    if (names.length === 0 && mgmt.Lastuser) {
+      names = String(mgmt.Lastuser).split(/[\s　]+/).filter(Boolean);
+    }
+
+    const d = { from: mgmt.From, to: mgmt.To, names: names, rawBlock: mgmt.Block || "", rideDate: ride, depTime: dep, arrTime: arr };
+    const t = buildEventTime_(d);
+    if (!t) throw new Error("時刻が不正です（出発/到着/乗車日）");
+
+    const evIds = syncCalendarEvents_(mgmt.row, mgmt.EventId || "", d);
+    if (evIds) {
+      updateMgmt_(mgmt.row, { EventId: evIds, Status: "処理済" });
+      audit_("カレンダー再同期", String(mgmt.ReserveNo || ""), String(mgmt.MainSheet || ""), String(mgmt.MainRow || ""), "OK", "EventId=" + evIds);
+      safeAlert_("再同期完了", "カレンダーを更新しました（複数名対応）。");
+      return;
+    }
+    updateMgmt_(mgmt.row, { Status: "キャンセル保留" });
+    audit_("カレンダー再同期", String(mgmt.ReserveNo || ""), String(mgmt.MainSheet || ""), String(mgmt.MainRow || ""), "PENDING", "calendar_upsert failed");
+    notifyAdminGas_("カレンダー再同期 保留", buildCalendarResyncPendingBody_(mgmt, "複数名予定"), "CAL_RESYNC_PENDING:" + String(mgmt.row || ""));
+    safeAlert_("再同期保留", "カレンダー更新に失敗したため保留にしました。\n再試行キュー処理（processRetryQueue）を実行してください。");
+  } finally { lock.releaseLock(); }
+}
+
+function resyncCalendarForSelectedRows() {
+  if (checkBreakerBeforeRun_()) return;
+  const sh = SpreadsheetApp.getActiveSheet();
+  const currentName = String(sh.getName() || "").trim();
+  const targetName = String(CONFIG.MGMT_SHEET || "").trim();
+  if (currentName !== targetName) {
+    SpreadsheetApp.getUi().alert("この機能は「" + targetName + "」シートでのみ実行できます。\n（現在のシート: " + currentName + "）");
+    return;
+  }
+  const ranges = sh.getActiveRangeList().getRanges();
+  if (!ranges.length) return;
+  const cKey = mgCol_("予約キー");
+  const cStatus = mgCol_("状態");
+  const cEventId = mgCol_("EventId");
+  const cBlock = mgCol_("予約本文ブロック");
+  const rows = new Set();
+  for (const rng of ranges) {
+    const start = rng.getRow();
+    const num = rng.getNumRows();
+    if (start < 2) continue;
+    for (let i = 0; i < num; i++) { rows.add(start + i); }
+  }
+  if (rows.size === 0) return;
+  const sortedRows = Array.from(rows).sort((a, b) => a - b);
+  let processed = 0, deleted = 0, skipped = 0;
+  SpreadsheetApp.getActive().toast(rows.size + "件のカレンダー同期を開始します...");
+  for (const r of sortedRows) {
+    const key = String(sh.getRange(r, cKey).getValue() || "").trim();
+    const status = String(sh.getRange(r, cStatus).getValue() || "").trim();
+    const eventId = String(sh.getRange(r, cEventId).getValue() || "").trim();
+    const block = String(sh.getRange(r, cBlock).getValue() || "");
+    if (!key) { skipped++; continue; }
+    const isRefundContent = block.includes("払戻") || block.includes("払い戻し");
+    const isCancelledStatus = ["払戻済", "キャンセル", "取消", "削除", "重複(無効)"].includes(status);
+    if (isCancelledStatus || isRefundContent) {
+      if (eventId) {
+        deleteEvents_(eventId);
+        sh.getRange(r, cEventId).setValue("");
+        if (status === "処理済" && isRefundContent) sh.getRange(r, cStatus).setValue("払戻(反映済)");
+        audit_("カレンダー同期(手動)", "", "", String(r), "DELETED", "Refund/Cancel detected");
+        deleted++;
+      } else { skipped++; }
+    } else {
+      try {
+        resyncCalendarByKey_(key);
+        processed++;
+      } catch (e) {
+        console.warn("Row " + r + " sync failed: " + e);
+        audit_("カレンダー同期(手動)", "", "", String(r), "ERROR", String(e));
+      }
+    }
+    Utilities.sleep(3000);
+  }
+  const msg = processed + "件 更新/作成\n" + deleted + "件 削除\n" + skipped + "件 スキップ/対象外";
+  SpreadsheetApp.getUi().alert("カレンダー同期完了", msg, SpreadsheetApp.getUi().ButtonSet.OK);
+}
+
+function cancelByMgmtRow() {
+  ensureAll_();
+  const ui = SpreadsheetApp.getUi();
+  const p = ui.prompt("キャンセル（管理行番号指定）", "スマートEX管理（MGMT）の行番号を入力してください（例：12）", ui.ButtonSet.OK_CANCEL);
+  if (p.getSelectedButton() !== ui.Button.OK) return;
+  const row = Number(String(p.getResponseText() || "").trim());
+  if (!row || row < 2) throw new Error("行番号が不正です（2以上）");
+  const lock = LockService.getScriptLock();
+  if (!lock.tryLock(30000)) throw new Error("ロック取得に失敗しました（他処理実行中）");
+  try {
+    const ss = ssLog_();
+    const sh = ss.getSheetByName(CONFIG.MGMT_SHEET);
+    const lastRow = sh.getLastRow();
+    if (row > lastRow) throw new Error("行番号が範囲外です（最終行: " + lastRow + "）");
+    const mgmt = readMgmtByRow_(row);
+    runCancel_(mgmt, "管理行指定");
+  } finally {
+    lock.releaseLock();
+  }
+}
+
+function cancelByReservationKey() {
+  ensureAll_();
+  const ui = SpreadsheetApp.getUi();
+  const p = ui.prompt("キャンセル（予約キー指定）", "予約キーを入力してください（MGMTの「予約キー」列の値）", ui.ButtonSet.OK_CANCEL);
+  if (p.getSelectedButton() !== ui.Button.OK) return;
+  const key = String(p.getResponseText() || "").trim();
+  if (!key) throw new Error("予約キーが空です");
+  const lock = LockService.getScriptLock();
+  if (!lock.tryLock(30000)) throw new Error("ロック取得に失敗しました（他処理実行中）");
+  try {
+    const mgmt = getMgmtByKey_(key);
+    if (!mgmt) throw new Error("指定した予約キーが管理シートで見つかりません: " + key);
+    runCancel_(mgmt, "予約キー指定");
+  } finally {
+    lock.releaseLock();
+  }
+}
+
+function runCancel_(mgmt, triggerType) {
+  const ui = SpreadsheetApp.getUi();
+  const reserveNo = String(mgmt.ReserveNo || "");
+  const ride = (mgmt.RideDate instanceof Date) ? Utilities.formatDate(mgmt.RideDate, Session.getScriptTimeZone(), "yyyy-MM-dd") : String(mgmt.RideDate || "");
+  const from = String(mgmt.From || "");
+  const to = String(mgmt.To || "");
+  const dep = String(mgmt.Dep || "");
+  const arr = String(mgmt.Arr || "");
+  const mainSheet = String(mgmt.MainSheet || "");
+  const mainRow = String(mgmt.MainRow || "");
+  const eventId = String(mgmt.EventId || "");
+  const status = String(mgmt.Status || "");
+  const key = String(mgmt.Key || "");
+
+  if (status === "キャンセル") {
+    const res0 = ui.alert("既にキャンセル状態です", "状態が既に「キャンセル」です。続行しますか？", ui.ButtonSet.YES_NO);
+    if (res0 !== ui.Button.YES) return;
+  }
+  const summary = (ride ? ride + " " : "") + (from && to ? `${from}→${to}` : "") + ((dep && arr) ? `（${dep}-${arr}）` : "");
+  const mainInfo = readMainRowSummary_(mgmt);
+  const mainLine = mainInfo ? `Main確認: ${mainInfo.sheetName} 行 ${mainInfo.row} / 日付=${mainInfo.d} / 金額=${mainInfo.a} / 利用者=${mainInfo.target}` : "Main確認: （参照なし/取得失敗）";
+  const detail = "以下の予約をキャンセル（カレンダー削除＋MGMT更新）します。\n\n対象: " + (summary ? summary : "（情報不足）") + "\n実行元: " + String(triggerType || "") + "\n管理行: " + String(mgmt.row || "") + "\nお預かり番号: " + reserveNo + "\n状態(現在): " + status + "\n予約キー(MGMT): " + key + "\nMain: " + mainSheet + " 行 " + mainRow + "\n" + mainLine + "\nEventId: " + (eventId ? eventId : "（なし）") + "\n\nよろしいですか？";
+  const res = ui.alert("キャンセル実行確認", detail, ui.ButtonSet.YES_NO);
+  if (res !== ui.Button.YES) return;
+
+  let calMsg = "";
+  let calFailed = false;
+  if (eventId) {
+    try {
+      const cal = CalendarApp.getCalendarById(CONFIG.CALENDAR_ID);
+      const ids = eventId.split(",").filter(Boolean);
+      for (const id of ids) {
+        const ev = cal.getEventById(id);
+        if (ev) ev.deleteEvent();
+        Utilities.sleep(3000);
+      }
+      calMsg = "カレンダー削除: OK " + eventId;
+    } catch (e) {
+      calFailed = true;
+      calMsg = "カレンダー削除: 失敗 " + eventId + " / " + String(e && e.message ? e.message : e);
+    }
+  } else {
+    calMsg = "カレンダー削除: EventIdなし（スキップ）";
+  }
+
+  if (calFailed) {
+    updateMgmt_(mgmt.row, { Status: "キャンセル保留" });
+    audit_("キャンセル反映", reserveNo, mainSheet, mainRow, "PENDING", calMsg);
+    const mainLink = mainInfo ? makeMainSheetRowLink_(mainInfo.sheetName, mainInfo.row) : "";
+    const body = "キャンセル処理が保留になりました（カレンダー削除に失敗）。\n\n管理行: " + String(mgmt.row || "") + "\n予約キー: " + key + "\nお預かり番号: " + reserveNo + "\n対象: " + (summary ? summary : "") + "\nMain: " + mainSheet + " 行 " + mainRow + "\n" + (mainLink ? ("Mainリンク: " + mainLink + "\n") : "") + "EventId: " + eventId + "\n" + calMsg + "\n\n対応: メニュー「キャンセル（管理行番号指定）」で再実行してください。";
+    notifyAdminGas_("キャンセル保留", body, "CANCEL_PENDING:" + String(mgmt.row || ""));
+    ui.alert("キャンセル保留", "カレンダー削除に失敗したため「キャンセル保留」にしました。\n" + calMsg, ui.ButtonSet.OK);
+    return;
+  }
+  try {
+    updateMgmt_(mgmt.row, { Status: "キャンセル", EventId: "" });
+    const remarkMsg = markCancelledInRemarks_(mgmt);
+    audit_("キャンセル反映", reserveNo, mainSheet, mainRow, "OK", calMsg + (remarkMsg ? " / " + remarkMsg : ""));
+    ui.alert("キャンセル完了", "処理が完了しました。\n" + calMsg, ui.ButtonSet.OK);
+  } catch (e) {
+    const err = String(e && e.stack ? e.stack : e);
+    audit_("キャンセル反映", reserveNo, mainSheet, mainRow, "NG", err);
+    throw e;
+  }
+}
+
+function markCancelledInRemarks_(mgmt) {
+  const sheetName = String(mgmt.MainSheet || "").trim();
+  const row = Number(mgmt.MainRow || 0);
+  if (!sheetName || !row) return "";
+  const mgmtKey = String(mgmt.Key || "").trim();
+  if (!mgmtKey) return "";
+  const ss = ssMain_();
+  const sh = ss.getSheetByName(sheetName);
+  if (!sh) return "";
+  ensureMainKeyColumn_(sh);
+  const keyCell = sh.getRange(row, COL_MAIN.KEY);
+  const mainKey = String(keyCell.getValue() || "").trim();
+  if (mainKey && mainKey !== mgmtKey) return "備考追記: 予約キー不一致のためスキップ";
+  const cell = sh.getRange(row, COL_MAIN.REMARKS);
+  const cur = String(cell.getValue() || "").trim();
+  const prefix = "[CANCELLED]";
+  const stamp = Utilities.formatDate(new Date(), Session.getScriptTimeZone(), "yyyy-MM-dd HH:mm");
+  const line = `${prefix} ${stamp}`.trim();
+  if (!cur) {
+    safeSetValue_(cell, line);
+    return "備考追記: OK";
+  }
+  if (cur.includes(prefix)) return "備考追記: 既にあり（スキップ）";
+  safeSetValue_(cell, cur + "\n" + line);
+  return "備考追記: OK";
+}
